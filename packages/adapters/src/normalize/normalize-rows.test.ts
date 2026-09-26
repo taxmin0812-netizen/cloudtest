@@ -138,6 +138,8 @@ describe('사업용 신용카드 정규화', () => {
     expect(d[0]!.method).toBe('vat_inclusive_10pct');
     expect(d[0]!.fields).toEqual(['supplyAmount', 'vatAmount']);
     expect(res.stats.derivedRows).toBe(1);
+    // 추정 금액은 검토가 필요하다는 행 경고를 남긴다
+    expect(res.warnings.filter((w) => w.code === 'amounts_estimated').map((w) => w.sourceRowNumber)).toEqual([11]);
   });
 
   it('실패 사유는 한국어, 필드 표시, 파싱 가능한 금액 보존', () => {
@@ -475,5 +477,105 @@ describe('기타 규칙', () => {
     expect(parseAccountCell('83000.소모품비')).toEqual({ code: '83000', name: '소모품비' });
     expect(parseAccountCell('소모품비')).toEqual({ code: null, name: '소모품비' });
     expect(parseAccountCell('')).toBeNull();
+  });
+});
+
+describe('리뷰 보강: 조용한 오류·개인정보', () => {
+  it('통화가 원화가 아닌데 외화금액 열이 없으면 원화로 가정하지 않고 실패 (금액 합계에도 넣지 않음)', () => {
+    const rows = [
+      ['승인일자', '카드번호', '가맹점사업자번호', '가맹점명', '합계', '통화', '공제여부결정'],
+      ['2026-09-01', '4111-1111-1111-1111', '', 'AWS', 25, 'USD', '공제'],
+      ['2026-09-02', '4111-1111-1111-1111', '', '국내가맹점', 1100, 'KRW', '공제'],
+    ];
+    const res = normalizeRows(detectFormat(rows), rows, ctx);
+    expectExactAccounting(res, rows);
+    expect(res.transactions.map((t) => t.merchantName)).toEqual(['국내가맹점']);
+    expect(res.failures[0]).toMatchObject({ code: 'foreign_amount_not_won', field: 'currency', amounts: null });
+    expect(res.failures[0]!.reason).toContain('USD');
+    expect(res.sourceTotals.totalAmount).toBe(1100);
+  });
+
+  it('2^53 을 넘는 숫자 셀(카드번호가 숫자로 저장)도 rawData 에서 마스킹', () => {
+    const rows = [
+      ['승인일자', '가맹점사업자번호', '가맹점명', '합계', '공제여부결정', '메모번호'],
+      ['2026-09-01', '', '문구점', 1100, '공제', 9410123456789012],
+    ];
+    const res = normalizeRows(detectFormat(rows), rows, ctx);
+    const raw = JSON.stringify(res.transactions[0]!.rawData);
+    expect(raw).not.toContain('9410123456789012');
+    expect(res.transactions[0]!.rawData['메모번호']).toBe('9410-****-****-9012');
+  });
+
+  it('실패 사유에 들어가는 원본 값의 주민번호도 가린다', () => {
+    const rows = [
+      ['승인일자', '가맹점사업자번호', '가맹점명', '합계', '공제여부결정'],
+      ['2026-09-01', '', '문구점', '900101-1234567', '공제'],
+    ];
+    const res = normalizeRows(detectFormat(rows), rows, ctx);
+    expect(res.failures[0]!.code).toBe('invalid_amount');
+    expect(JSON.stringify(res.failures)).not.toContain('1234567');
+  });
+
+  it('숫자 셀로 저장된 24자리 승인번호(정밀도 손실)는 식별자로 쓰지 않는다 — 다른 계산서가 병합되지 않음', () => {
+    const header = ['작성일자', '승인번호', '공급자사업자등록번호', '상호', '공급받는자사업자등록번호', '상호', '합계금액', '공급가액', '세액', '전자세금계산서분류'];
+    const me = CLIENT.businessNumber;
+    // 두 승인번호는 double 로 바뀌면 같은 값이 된다
+    const a = 202609104100001200000001;
+    const b = 202609104100001200000002;
+    expect(a).toBe(b);
+    const rows = [
+      header,
+      ['2026-09-10', a, VENDOR_A.bizno, VENDOR_A.name, me, CLIENT.name, 11000, 10000, 1000, '일반'],
+      ['2026-09-10', b, VENDOR_B.bizno, VENDOR_B.name, me, CLIENT.name, 11000, 10000, 1000, '일반'],
+    ];
+    const det = detectFormat(rows);
+    expect(det.profile.id).toBe('hometax_tax_invoice_v1');
+    const res = normalizeRows(det, rows, ctx);
+    expectExactAccounting(res, rows);
+    expect(res.transactions).toHaveLength(2);
+    expect(res.mergedRows).toHaveLength(0);
+    expect(res.transactions.every((t) => t.approvalNumber === null)).toBe(true);
+    expect(new Set(res.transactions.map((t) => t.fingerprint)).size).toBe(2);
+    expect(res.warnings.filter((w) => w.code === 'approval_number_precision')).toHaveLength(2);
+  });
+
+  it('면세 계산서 형식에 세액 열이 있고 값이 0 이 아니면 실패 (세금계산서 오판정 방어)', () => {
+    const header = ['작성일자', '승인번호', '공급자사업자등록번호', '상호', '공급받는자사업자등록번호', '상호', '합계금액', '공급가액', '세액', '전자계산서분류'];
+    const me = CLIENT.businessNumber;
+    const rows = [
+      header,
+      ['2026-09-03', '20260903-51000012-00000001', VENDOR_A.bizno, VENDOR_A.name, me, CLIENT.name, 300000, 300000, 0, '일반'],
+      ['2026-09-04', '20260904-51000012-00000002', VENDOR_A.bizno, VENDOR_A.name, me, CLIENT.name, 110000, 100000, 10000, '일반'],
+    ];
+    const det = detectFormat(rows);
+    expect(det.profile.id).toBe('hometax_invoice_exempt_v1');
+    const res = normalizeRows(det, rows, ctx);
+    expectExactAccounting(res, rows);
+    expect(res.transactions).toHaveLength(1);
+    expect(res.transactions[0]).toMatchObject({ evidenceType: 'invoice_exempt', vatAmount: 0, totalAmount: 300000 });
+    expect(res.failures[0]!.code).toBe('exempt_vat_nonzero');
+  });
+});
+
+describe('리뷰 보강: 세금계산서 품목 행 병합 안전장치', () => {
+  it('같은 승인번호·같은 금액 행이라도 품목공급가액 합이 공급가액과 다르면 병합하지 않고 모두 실패', () => {
+    const header = ['작성일자', '승인번호', '공급자사업자등록번호', '상호', '공급받는자사업자등록번호', '상호', '합계금액', '공급가액', '세액', '품목명', '품목공급가액', '전자세금계산서분류'];
+    const me = CLIENT.businessNumber;
+    const apv = '20260920-41000012-00000009';
+    // 행마다 품목 금액(10,000)이 공급가액 칸에 적힌 형식이라면 실제 공급가액은 20,000 — 합치면 10,000 이 사라진다
+    const rows = [
+      header,
+      ['2026-09-20', apv, VENDOR_A.bizno, VENDOR_A.name, me, CLIENT.name, 11000, 10000, 1000, '볼펜', 10000, '일반'],
+      ['2026-09-20', apv, VENDOR_A.bizno, VENDOR_A.name, me, CLIENT.name, 11000, 10000, 1000, '연필', 10000, '일반'],
+    ];
+    const res = normalizeRows(detectFormat(rows), rows, ctx);
+    expectExactAccounting(res, rows);
+    expect(res.transactions).toHaveLength(0);
+    expect(res.mergedRows).toHaveLength(0);
+    expect(res.failures.map((f) => [f.sourceRowNumber, f.code])).toEqual([
+      [1, 'invoice_group_conflict'],
+      [2, 'invoice_group_conflict'],
+    ]);
+    expect(res.failures[0]!.reason).toContain('품목공급가액 합 20,000원');
   });
 });

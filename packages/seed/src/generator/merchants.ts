@@ -1,4 +1,4 @@
-import type { IndustryKey, Won } from '@mintax/core';
+import type { IndustryKey, VatTaxpayerType, Won } from '@mintax/core';
 import { makeAddress, makeBusinessNumber, makeEmail, makePersonName, type BizNoKind } from './ids';
 import { rngFor } from './prng';
 import type { EvidenceKind, MerchantKind, MerchantTaxType, SyntheticCustomer, SyntheticMerchant } from './types';
@@ -315,15 +315,28 @@ const BUILDERS: readonly IndustryKey[] = ['construction', 'interior'];
 const RESELLERS: readonly IndustryKey[] = ['ecommerce', 'wholesale_retail'];
 const ENTERTAINING: readonly IndustryKey[] = ['construction', 'interior', 'wholesale_retail', 'manufacturing', 'service'];
 
-/** 즉시상각 가능 한도 — 이 금액 이상이면 비품 등 자산 (법인세법 시행령 제31조④ 100만원 기준, 사무소 관행값) */
+/**
+ * 즉시상각 한도 — 취득가액이 이 금액을 "초과"하면 비품 등 자산으로 본다.
+ * 법인세법 시행령 제31조④: 거래단위별 취득가액 100만원 "이하"는 손금 계상 가능 (core RISK-ASSET-EXPENSE 도 공급가액 > 100만원).
+ */
 export const ASSET_THRESHOLD: Won = 1_000_000;
+
+/**
+ * 자산 판단용 취득가액. 매입세액을 공제받는 수임처(일반·겸영)는 공급가액, 공제받지 못하는 수임처(면세·간이)는 부가세 포함 합계.
+ * (간이과세자는 매입세액 대신 공급대가 0.5% 세액공제 → 부가세가 취득원가에 포함)
+ */
+export function acquisitionCostOf(t: { supplyAmount: Won; totalAmount: Won }, clientVatType: VatTaxpayerType): Won {
+  return clientVatType === 'exempt' || clientVatType === 'simplified' ? t.totalAmount : t.supplyAmount;
+}
 
 /**
  * 가맹점 종류 × 수임처 업종 × 금액 → 정답 계정코드.
  * 이력·당월 모두 이 함수로 정답을 만든다 (이상치 거래는 anomalies.ts 에서 개별 지정).
+ * acquisitionCost 는 자산(비품·공구) 판단에만 쓴다 — 생략하면 totalAmount.
  */
-export function truthAccountFor(kind: MerchantKind, industry: IndustryKey, totalAmount: Won): string {
+export function truthAccountFor(kind: MerchantKind, industry: IndustryKey, totalAmount: Won, acquisitionCost: Won = totalAmount): string {
   const amt = Math.abs(totalAmount);
+  const asset = Math.abs(acquisitionCost) > ASSET_THRESHOLD;
   switch (kind) {
     case 'coffee':
     case 'restaurant_meal':
@@ -351,7 +364,7 @@ export function truthAccountFor(kind: MerchantKind, industry: IndustryKey, total
     case 'ecommerce_market':
       if (BUILDERS.includes(industry)) return '830';
       if (RESELLERS.includes(industry)) return '146';
-      if (industry === 'design') return amt >= ASSET_THRESHOLD ? '212' : '830';
+      if (industry === 'design') return asset ? '212' : '830';
       return '830';
     case 'office_supply':
       return industry === 'design' || industry === 'it_service' ? '829' : '830';
@@ -364,7 +377,7 @@ export function truthAccountFor(kind: MerchantKind, industry: IndustryKey, total
       return '813';
     case 'electronics':
     case 'furniture':
-      return amt >= ASSET_THRESHOLD ? '212' : '830';
+      return asset ? '212' : '830';
     case 'saas_foreign':
     case 'saas_domestic':
       return '831';
@@ -391,7 +404,7 @@ export function truthAccountFor(kind: MerchantKind, industry: IndustryKey, total
     case 'building_materials':
       return BUILDERS.includes(industry) ? '153' : '820';
     case 'hardware_tools':
-      if (BUILDERS.includes(industry) || industry === 'manufacturing') return amt >= ASSET_THRESHOLD ? '210' : '830';
+      if (BUILDERS.includes(industry) || industry === 'manufacturing') return asset ? '210' : '830';
       return '830';
     case 'machine_parts':
       return industry === 'manufacturing' ? '153' : '820';

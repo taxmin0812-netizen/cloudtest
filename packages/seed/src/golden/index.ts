@@ -13,12 +13,13 @@ export { canonicalJson, checksumOf } from '../generator/canonical';
  * 생성기를 바꾸면 GOLDEN_EXPECTED / GOLDEN_CHECKSUM 이 달라져 테스트가 실패한다 — 의도한 변경이면 expected.ts 를 함께 갱신한다.
  */
 export const GOLDEN_SPEC = {
-  version: 1,
+  version: 2,
   seed: DEFAULT_SEED,
   period: CURRENT_MONTH,
   size: 1000,
   selection:
-    '2026-09 당월 거래 중 완전중복(기대 상태 duplicate)은 제외한다. 이상치·시나리오 표식이 있는 거래는 모두 넣고, ' +
+    '2026-09 당월 거래 중 완전중복(기대 상태 duplicate)은 제외한다. 이상치·시나리오 표식이 있는 거래와 ' +
+    '그 거래가 참조하는 원거래(중복 의심 상대·취소 원거래)는 모두 넣고, ' +
     '나머지는 거래처별 거래 수에 비례해(최대잔여법) 채운다. 거래처 안에서는 sha256(seed|golden|id) 오름차순으로 고르고, 최종 순서는 id 오름차순이다.',
 } as const;
 
@@ -70,7 +71,12 @@ function sortedRecord(rec: Record<string, number>): Record<string, number> {
 /** 골든 항목 선택 (결정적) */
 export function selectGoldenTransactions(ds: SyntheticDataset, size: number = GOLDEN_SPEC.size): SyntheticTransaction[] {
   const eligible = ds.current.filter((t) => t.truth.expectedStatus !== 'duplicate');
-  const mandatory = eligible.filter((t) => t.anomalies.length > 0 || t.scenarioTags.length > 0);
+  const flagged = eligible.filter((t) => t.anomalies.length > 0 || t.scenarioTags.length > 0);
+  // 중복 의심·취소는 원거래가 같은 배치에 있어야 판정할 수 있다 → 원거래도 필수
+  const referenced = new Set(flagged.flatMap((t) => [t.truth.possibleDuplicateOf, t.truth.cancelOf]).filter((x): x is string => !!x));
+  const mandatory = eligible.filter((t) => t.anomalies.length > 0 || t.scenarioTags.length > 0 || referenced.has(t.id));
+  const eligibleIds = new Set(eligible.map((t) => t.id));
+  for (const id of referenced) if (!eligibleIds.has(id)) throw new Error(`골든 필수 원거래 ${id} 가 당월 거래에 없습니다`);
   if (mandatory.length > size) throw new Error(`필수 골든 거래(${mandatory.length})가 크기(${size})보다 많습니다`);
   const mandatoryIds = new Set(mandatory.map((t) => t.id));
   const rest = eligible.filter((t) => !mandatoryIds.has(t.id));

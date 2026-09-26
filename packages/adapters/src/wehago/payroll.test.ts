@@ -5,6 +5,9 @@ import { readTabularFile } from '../file/read';
 import { computePayrollTotals, validatePayrollRows, verifyPayrollExportFile, writePayrollExport, type PayrollExportRow } from './payroll';
 import { WEHAGO_PAYROLL_BUSINESS_TEMPLATE, WEHAGO_PAYROLL_DAILY_TEMPLATE, WEHAGO_PAYROLL_EARNED_TEMPLATE } from './templates';
 
+/** MOCK 서식은 명시적으로 허용할 때만 파일을 만든다 */
+const MOCK_OK = { allowMockTemplate: true } as const;
+
 function earned(): PayrollExportRow[] {
   return [
     {
@@ -45,7 +48,7 @@ function earned(): PayrollExportRow[] {
 describe('급여자료 (MOCK 서식)', () => {
   it('생성 → 재검증 1원 일치, 수당은 열로 펼침', async () => {
     const rows = earned();
-    const buf = await writePayrollExport(WEHAGO_PAYROLL_EARNED_TEMPLATE, rows);
+    const buf = await writePayrollExport(WEHAGO_PAYROLL_EARNED_TEMPLATE, rows, MOCK_OK);
     const v = await verifyPayrollExportFile(buf, WEHAGO_PAYROLL_EARNED_TEMPLATE, { ...computePayrollTotals(rows), employeeIds: ['e1', 'e2'] });
     expect(v.ok).toBe(true);
     expect(v.actual).toMatchObject({ count: 2, grossPay: 5900000, netPay: 5238380 });
@@ -59,7 +62,7 @@ describe('급여자료 (MOCK 서식)', () => {
 
   it('차인지급액 1원 변조 → 전송 금지', async () => {
     const rows = earned();
-    const buf = await writePayrollExport(WEHAGO_PAYROLL_EARNED_TEMPLATE, rows);
+    const buf = await writePayrollExport(WEHAGO_PAYROLL_EARNED_TEMPLATE, rows, MOCK_OK);
     const wb = new ExcelJS.Workbook();
     await wb.xlsx.load(buf as unknown as ArrayBuffer);
     const col = WEHAGO_PAYROLL_EARNED_TEMPLATE.columns.findIndex((c) => c.field === 'netPay') + 1;
@@ -79,7 +82,7 @@ describe('급여자료 (MOCK 서식)', () => {
     rows[1]!.incomeType = 'business';
     const v = validatePayrollRows(WEHAGO_PAYROLL_EARNED_TEMPLATE, rows);
     expect(v.errors.map((e) => e.code)).toEqual(expect.arrayContaining(['gross_mismatch', 'net_mismatch', 'duplicate_code', 'income_type']));
-    await expect(writePayrollExport(WEHAGO_PAYROLL_EARNED_TEMPLATE, rows)).rejects.toThrowError(AdapterError);
+    await expect(writePayrollExport(WEHAGO_PAYROLL_EARNED_TEMPLATE, rows, MOCK_OK)).rejects.toThrowError(AdapterError);
   });
 });
 
@@ -106,7 +109,7 @@ describe('사업소득 · 일용직', () => {
         taxRate: 3,
       },
     ];
-    const buf = await writePayrollExport(WEHAGO_PAYROLL_BUSINESS_TEMPLATE, rows);
+    const buf = await writePayrollExport(WEHAGO_PAYROLL_BUSINESS_TEMPLATE, rows, MOCK_OK);
     const f = await readTabularFile(buf, 'biz.xlsx');
     const idCol = WEHAGO_PAYROLL_BUSINESS_TEMPLATE.columns.findIndex((c) => c.field === 'idNumber');
     expect(f.sheets[0]!.rows[1]![idCol]).toBe('9001011234567');
@@ -114,7 +117,7 @@ describe('사업소득 · 일용직', () => {
     expect(v.ok).toBe(true);
     const warn = validatePayrollRows(WEHAGO_PAYROLL_BUSINESS_TEMPLATE, [{ ...rows[0]!, idNumber: null }]);
     expect(warn.ok).toBe(true);
-    expect(warn.warnings.map((w) => w.code)).toEqual(['missing_id']);
+    expect(warn.warnings.map((w) => w.code)).toEqual(['unverified_template', 'missing_id']);
     // 오류 메시지에는 주민번호가 들어가지 않는다
     const bad = validatePayrollRows(WEHAGO_PAYROLL_BUSINESS_TEMPLATE, [{ ...rows[0]!, idNumber: '900101-12345' }]);
     expect(JSON.stringify(bad)).not.toContain('90010112345');
@@ -144,5 +147,57 @@ describe('사업소득 · 일용직', () => {
     const v = validatePayrollRows(WEHAGO_PAYROLL_DAILY_TEMPLATE, [{ ...base, workDays: 0 }, { ...base, employeeCode: 'D02', employeeId: 'd2', dailyWage: 140000 }]);
     expect(v.errors.map((e) => e.code)).toContain('missing_work_days');
     expect(v.warnings.map((w) => w.code)).toContain('daily_wage_mismatch');
+  });
+});
+
+describe('MOCK 서식 · 재검증 강화 (리뷰 보강)', () => {
+  it('MOCK 서식은 명시적 허용 없이는 파일을 만들지 않는다 (업로드용 오인 방지)', async () => {
+    await expect(writePayrollExport(WEHAGO_PAYROLL_EARNED_TEMPLATE, earned())).rejects.toThrowError(/임시\(MOCK\) 서식/);
+    const v = validatePayrollRows(WEHAGO_PAYROLL_EARNED_TEMPLATE, earned());
+    expect(v.ok).toBe(true);
+    expect(v.warnings.find((w) => w.code === 'unverified_template')?.message).toContain('업로드하지 마세요');
+  });
+
+  async function edit(buf: Buffer, fn: (ws: ExcelJS.Worksheet) => void): Promise<Buffer> {
+    const wb = new ExcelJS.Workbook();
+    await wb.xlsx.load(buf as unknown as ArrayBuffer);
+    fn(wb.worksheets[0]!);
+    return Buffer.from((await wb.xlsx.writeBuffer()) as ArrayBuffer);
+  }
+  const expected = () => ({ ...computePayrollTotals(earned()), employeeIds: ['e1', 'e2'] });
+
+  it('금액이 텍스트 셀이면 (값이 같아도) 전송 금지', async () => {
+    const buf = await writePayrollExport(WEHAGO_PAYROLL_EARNED_TEMPLATE, earned(), MOCK_OK);
+    const col = WEHAGO_PAYROLL_EARNED_TEMPLATE.columns.findIndex((c) => c.field === 'netPay') + 1;
+    const bad = await edit(buf, (ws) => {
+      const c = ws.getRow(2).getCell(col);
+      c.value = (c.value as number).toLocaleString('ko-KR');
+    });
+    const v = await verifyPayrollExportFile(bad, WEHAGO_PAYROLL_EARNED_TEMPLATE, expected());
+    expect(v.ok).toBe(false);
+    expect(v.diffs.map((d) => d.code)).toContain('unreadable_amount');
+  });
+
+  it('사원코드(텍스트) 변경 → 내용 지문 불일치, 추가된 행 → 추적 안 된 행', async () => {
+    const buf = await writePayrollExport(WEHAGO_PAYROLL_EARNED_TEMPLATE, earned(), MOCK_OK);
+    const codeChanged = await edit(buf, (ws) => {
+      ws.getRow(2).getCell(1).value = '9999';
+    });
+    const v1 = await verifyPayrollExportFile(codeChanged, WEHAGO_PAYROLL_EARNED_TEMPLATE, expected());
+    expect(v1.ok).toBe(false);
+    expect(v1.diffs.map((d) => d.code)).toContain('row_content_mismatch');
+
+    const added = await edit(buf, (ws) => {
+      ws.getRow(4).values = ['1003', '추가', '2026-09', '2026-09-25', 0, 0, 0, 0, 0, 0, 0];
+    });
+    const v2 = await verifyPayrollExportFile(added, WEHAGO_PAYROLL_EARNED_TEMPLATE, expected());
+    expect(v2.ok).toBe(false);
+    expect(v2.diffs.map((d) => d.code)).toEqual(expect.arrayContaining(['untraced_row', 'total_mismatch']));
+  });
+
+  it('손상된 파일도 예외 대신 전송 금지 결과', async () => {
+    const v = await verifyPayrollExportFile(Buffer.from('not a zip'), WEHAGO_PAYROLL_EARNED_TEMPLATE, expected());
+    expect(v.ok).toBe(false);
+    expect(v.diffs[0]!.code).toBe('sheet_missing');
   });
 });

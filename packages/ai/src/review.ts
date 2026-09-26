@@ -671,7 +671,7 @@ export function checkDeemedInputTax(
         code: 'VAT-DEEMED-CANDIDATE',
         clientId,
         title: '의제매입세액공제 검토',
-        detail: `${vat.label} ${summary}이(가) 의제매입 미반영 상태입니다. 계산서·카드(면세분) 증빙으로 공제신고서 반영 여부를 확인하세요. 공제율·한도는 업종·과세표준에 따라 다릅니다 (예: 음식점 개인 8/108).`,
+        detail: `${vat.label} ${summary}이(가) 의제매입 미반영 상태입니다. 계산서·카드(면세분) 증빙으로 공제신고서 반영 여부를 확인하세요. 공제율·한도는 업종·과세표준에 따라 다릅니다 (예: 음식점 개인 8/108, 과세표준 2억원 이하는 2026-12-31까지 9/109, 법인 6/106).`,
         severity: 'warning',
         metric: { current: total, baseline: 0, changeRate: 0 },
         action: { label: '면세 매입 확인', href },

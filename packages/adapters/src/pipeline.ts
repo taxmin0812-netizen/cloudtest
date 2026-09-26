@@ -57,6 +57,9 @@ export async function previewImport(
   };
 }
 
+/** 파일 속 수임처가 이 신뢰도 이상으로 다른 곳을 가리키면 적재를 막는다 (기본값, 설정으로 조정) */
+export const DEFAULT_CLIENT_CONFLICT_MIN_CONFIDENCE = 90;
+
 export interface ImportOptions {
   clients?: readonly ClientRef[];
   read?: ReadOptions;
@@ -66,6 +69,13 @@ export interface ImportOptions {
   sheetIndex?: number;
   /** 파일 속 수임처와 선택한 수임처가 달라도 진행 (기본 false → 오류) */
   allowClientConflict?: boolean;
+  /** 수임처 불일치로 막는 최소 신뢰도 (기본 DEFAULT_CLIENT_CONFLICT_MIN_CONFIDENCE) */
+  clientConflictMinConfidence?: number;
+  /**
+   * 이 가져오기의 용도 (기본 'transactions').
+   * WEHAGO 매입매출장(역수입) 파일을 거래로 적재하면 이미 전송한 전표가 새 거래로 이중 계상된다 → 용도가 다르면 거부.
+   */
+  purpose?: 'transactions' | 'reconciliation';
 }
 
 /**
@@ -84,7 +94,8 @@ export async function importTabularFile(
     ...(opts.sheetIndex !== undefined ? { sheetIndex: opts.sheetIndex } : {}),
   });
   const best = preview.client?.best;
-  if (best && !preview.client!.ambiguous && best.confidence >= 90 && best.clientId !== ctx.clientId && !opts.allowClientConflict) {
+  const conflictMin = opts.clientConflictMinConfidence ?? DEFAULT_CLIENT_CONFLICT_MIN_CONFIDENCE;
+  if (best && !preview.client!.ambiguous && best.confidence >= conflictMin && best.clientId !== ctx.clientId && !opts.allowClientConflict) {
     const selected = normalizeBusinessNumber(ctx.businessNumber);
     throw new AdapterError(
       'INVALID_CONTEXT',
@@ -93,6 +104,16 @@ export async function importTabularFile(
     );
   }
   const detection = opts.detection ?? preview.detection;
+  const purpose = opts.purpose ?? 'transactions';
+  if (detection.profile.purpose !== purpose) {
+    throw new AdapterError(
+      'INVALID_CONTEXT',
+      detection.profile.purpose === 'reconciliation'
+        ? `${detection.profile.name} 파일입니다 — 거래 가져오기가 아니라 대사(WEHAGO 반영 확인) 메뉴에서 올려 주세요. 거래로 적재하면 이중 계상됩니다.`
+        : `${detection.profile.name} 파일은 대사용 파일이 아닙니다 — 거래 가져오기 메뉴에서 올려 주세요.`,
+      { profileId: detection.profile.id, purpose: detection.profile.purpose },
+    );
+  }
   const result = normalizeRows(detection, preview.rows, { ...ctx, sheetName: ctx.sheetName ?? preview.sheetName });
   for (const o of preview.otherDataSheets) {
     result.warnings.push({ sourceRowNumber: null, code: 'other_sheet_not_imported', message: otherSheetMessage(o) });

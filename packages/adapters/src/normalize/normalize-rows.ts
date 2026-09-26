@@ -281,7 +281,8 @@ class RowNormalizer {
         outcomes.push(this.normalizeOne(row, raw, sourceRowNumber));
       } catch (e) {
         if (!(e instanceof RowFailureSignal)) throw e;
-        const failure: RowFailure = { sourceRowNumber, rawData: raw, reason: e.reason, code: e.code, amounts: e.amounts };
+        // 사유에 원본 셀 값이 들어가므로(열이 밀린 파일 등) 카드번호·주민번호를 한 번 더 가린다
+        const failure: RowFailure = { sourceRowNumber, rawData: raw, reason: scrubFreeText(e.reason), code: e.code, amounts: e.amounts };
         if (e.field) failure.field = e.field;
         outcomes.push({ kind: 'fail', failure });
       }
@@ -472,6 +473,11 @@ class RowNormalizer {
     const description = cancelled ? (baseDesc ? `취소 · ${baseDesc}` : '취소') : baseDesc;
 
     if (derived.length > 0) raw.__derived = derived;
+    // 합계만 보고 과세/면세를 추정한 금액은 매입세액 공제에 바로 쓰면 안 된다 → 행 경고로 남겨 검토로 보낸다
+    const estimated = derived.find((d) => d.method === 'vat_inclusive_10pct' || d.method === 'exempt_total_as_supply' || d.method === 'simplified_total_as_supply');
+    if (estimated) {
+      this.warn(sourceRowNumber, 'amounts_estimated', `합계만 있어 공급가액·세액을 추정했습니다 (${estimated.note}) — 원본 증빙으로 확인 후 승인하세요.`);
+    }
     if (ledger) raw.__ledger = ledger;
 
     const tx: NormalizedTransaction = {
@@ -745,6 +751,13 @@ class RowNormalizer {
     const drop = new Set<Outcome>();
     const conflictFailures = new Map<Outcome, RowFailure>();
     const mergedRows: MergedRow[] = [];
+    /** 병합된 행의 원본 (품목 합계 검산이 실패하면 병합을 되돌려 실패로 남기기 위해) */
+    const mergedSources = new Map<NormalizedTransaction, Array<{ sourceRowNumber: number; rawData: Record<string, unknown>; amounts: RowAmounts | null }>>();
+    const addMerged = (head: NormalizedTransaction, src: { sourceRowNumber: number; rawData: Record<string, unknown>; amounts: RowAmounts | null }) => {
+      const list = mergedSources.get(head);
+      if (list) list.push(src);
+      else mergedSources.set(head, [src]);
+    };
 
     for (const g of groups.values()) {
       if (g.length < 2) continue;
@@ -758,6 +771,7 @@ class RowNormalizer {
           items.push(this.itemOf(o.row, o.tx.sourceRowNumber!));
           drop.add(o);
           mergedRows.push({ sourceRowNumber: o.tx.sourceRowNumber!, intoSourceRowNumber: head.tx.sourceRowNumber!, reason: `승인번호 ${head.tx.approvalNumber} 의 품목 행` });
+          addMerged(head.tx, { sourceRowNumber: o.tx.sourceRowNumber!, rawData: o.tx.rawData, amounts: { supplyAmount: o.tx.supplyAmount, vatAmount: o.tx.vatAmount, totalAmount: o.tx.totalAmount } });
         }
         head.tx.rawData.__items = items;
       } else {
@@ -801,14 +815,43 @@ class RowNormalizer {
         items.push(this.itemOf(o.row, o.sourceRowNumber));
         ptx.rawData.__items = items;
         mergedRows.push({ sourceRowNumber: o.sourceRowNumber, intoSourceRowNumber: ptx.sourceRowNumber!, reason: `승인번호 ${ptx.approvalNumber} 의 품목 행 (금액 빈칸)` });
+        addMerged(ptx, { sourceRowNumber: o.sourceRowNumber, rawData: o.raw, amounts: null });
       }
     }
+
+    // 병합한 묶음의 품목공급가액 합이 공급가액과 다르면, 행마다 품목 금액이 적힌 형식일 수 있다
+    // (같은 금액 품목 2개가 한 건으로 합쳐져 금액이 사라지는 사고) → 병합을 되돌리고 모두 실패로 남긴다
+    const undone = new Set<number>();
+    const kept: NormalizedTransaction[] = [];
     for (const tx of transactions) {
       const items = tx.rawData.__items as Array<Record<string, unknown>> | undefined;
-      if (items) this.checkItemSum(tx, items);
+      const sum = items ? this.itemSupplySum(items) : null;
+      if (!items || sum === null || sum === tx.supplyAmount) {
+        kept.push(tx);
+        continue;
+      }
+      const reason = `승인번호 ${tx.approvalNumber}: 품목 행 ${items.length}개의 품목공급가액 합 ${formatWon(sum)} ≠ 공급가액 ${formatWon(tx.supplyAmount)} — 품목별 금액 행인지 원본에서 확인해 주세요 (합쳐서 적재하지 않음).`;
+      failures.push({ sourceRowNumber: tx.sourceRowNumber!, rawData: tx.rawData, reason, field: 'itemSupplyAmount', code: 'invoice_group_conflict', amounts: { supplyAmount: tx.supplyAmount, vatAmount: tx.vatAmount, totalAmount: tx.totalAmount } });
+      for (const m of mergedSources.get(tx) ?? []) {
+        failures.push({ sourceRowNumber: m.sourceRowNumber, rawData: m.rawData, reason, field: 'itemSupplyAmount', code: 'invoice_group_conflict', amounts: m.amounts });
+        undone.add(m.sourceRowNumber);
+      }
     }
-    mergedRows.sort((a, b) => a.sourceRowNumber - b.sourceRowNumber);
-    return { transactions, failures, mergedRows };
+    const finalMerged = mergedRows.filter((m) => !undone.has(m.sourceRowNumber));
+    finalMerged.sort((a, b) => a.sourceRowNumber - b.sourceRowNumber);
+    failures.sort((a, b) => a.sourceRowNumber - b.sourceRowNumber);
+    return { transactions: kept, failures, mergedRows: finalMerged };
+  }
+
+  /** 품목공급가액 합 (하나라도 비었거나 읽을 수 없으면 null — 검산 생략) */
+  private itemSupplySum(items: Array<Record<string, unknown>>): number | null {
+    let sum = 0;
+    for (const i of items) {
+      const v = parseWon(i.itemSupplyAmount ?? null);
+      if (v === null) return null;
+      sum += v;
+    }
+    return sum;
   }
 
   private itemOf(row: readonly unknown[], sourceRowNumber: number): Record<string, unknown> {
@@ -826,15 +869,6 @@ class RowNormalizer {
       itemSupplyAmount: pick('itemSupplyAmount'),
       itemVatAmount: pick('itemVatAmount'),
     };
-  }
-
-  private checkItemSum(tx: NormalizedTransaction, items: Array<Record<string, unknown>>): void {
-    const vals = items.map((i) => parseWon(i.itemSupplyAmount ?? null));
-    if (vals.some((v) => v === null)) return;
-    const sum = (vals as number[]).reduce((a, b) => a + b, 0);
-    if (sum !== tx.supplyAmount) {
-      this.warn(tx.sourceRowNumber, 'item_sum_mismatch', `승인번호 ${tx.approvalNumber}: 품목 공급가액 합 ${formatWon(sum)} ≠ 공급가액 ${formatWon(tx.supplyAmount)}`);
-    }
   }
 
   // ── rawData ──

@@ -301,7 +301,7 @@ describe('reconcile — WEHAGO 역수입 비교', () => {
     expect(missing.message).toBe('2026-09-10 상점t3 220,000원 거래가 WEHAGO에 반영되지 않았습니다.');
     expect(missing.blocking).toBe(true);
     const extra = r.discrepancies.find((d) => d.kind === 'extra_in_wehago')!;
-    expect(extra.blocking).toBe(false);
+    expect(extra.blocking).toBe(true);
     expect(extra.message).toContain('WEHAGO에만 있는 전표입니다: 2026-09-30 직접입력전표 1,100원');
     expect(r.discrepancies.find((d) => d.kind === 'amount_mismatch')!.message).toContain('WEHAGO 금액이 전송 금액과 다릅니다');
   });

@@ -92,6 +92,32 @@ describe('createAIProvider', () => {
     expect(r).toMatchObject({ accountCode: '822', confidence: 85, provider: 'anthropic' });
   });
 
+  it('상태 목록에 실제 사용 중인 인스턴스 상태(인증 실패 등)를 반영하고, 대체 사유를 따로 표기', async () => {
+    const env = { AI_PROVIDER: 'anthropic', ANTHROPIC_API_KEY: 'sk-ant-x' };
+    const { AuthenticationError } = await import('@anthropic-ai/sdk');
+    const client: MessagesClient = { messages: { create: () => Promise.reject(new AuthenticationError(401, {}, 'invalid', new Headers())) } };
+    const current = createAIProvider(env, { anthropic: { client, retryDelayMs: 0 } });
+    expect(listProviderStatuses(env, { current })[1]).toMatchObject({ status: 'LIVE', active: true });
+    await current.classifyTransaction({
+      merchantName: 'SK에너지',
+      merchantCategory: null,
+      description: '',
+      totalAmount: 50_000,
+      evidenceType: 'card',
+      direction: 'purchase',
+      industry: 'service',
+      candidateAccounts: [{ code: '822', name: '차량유지비' }],
+      similarExamples: [],
+    });
+    // 새 인스턴스로 만들면 여전히 LIVE 로 보이지만, 실제 인스턴스를 넘기면 NOT_AVAILABLE
+    expect(listProviderStatuses(env)[1]!.status).toBe('LIVE');
+    expect(listProviderStatuses(env, { current })[1]).toMatchObject({ status: 'NOT_AVAILABLE', active: true });
+
+    const fallback = listProviderStatuses({ AI_PROVIDER: 'anthropic' });
+    expect(fallback[0]).toMatchObject({ statusReason: '로컬 규칙 기반 추론 (LLM 아님)', active: true, fallbackReason: 'ANTHROPIC_API_KEY 미설정 — 로컬 휴리스틱으로 대체' });
+    expect(listProviderStatuses({})[0]!.fallbackReason).toBeUndefined();
+  });
+
   it('process.env 기본값으로도 동작', () => {
     expect(() => createAIProvider()).not.toThrow();
     expect(listProviderStatuses()).toHaveLength(2);

@@ -59,6 +59,8 @@ describe('종류별 내용', () => {
       expect(orig.channel).toBe('hometax_file');
       expect(d.truth.expectedStatus).toBe('duplicate');
       expect(d.truth.accountCode).toBe(orig.truth.accountCode);
+      // 재전송은 같은 원본 행 — 파일에서도 같은 행으로 보여야 파일 경로 fingerprint 가 같다
+      expect(d.rawData).toEqual(orig.rawData);
     }
   });
 
@@ -83,12 +85,14 @@ describe('종류별 내용', () => {
     }
   });
 
-  it('고액 자산: 노트북 2,300,000원 포함, 모두 212 비품·100만원 이상', () => {
+  it('고액 자산: 노트북 2,300,000원 포함, 모두 212 비품·1대 취득가액(공급가액) 100만원 초과', () => {
     const assets = withKind('asset_purchase');
     expect(assets.some((t) => t.description === '노트북' && t.totalAmount === 2_300_000)).toBe(true);
     for (const t of assets) {
       expect(t.truth.accountCode).toBe('212');
-      expect(t.totalAmount).toBeGreaterThanOrEqual(1_000_000);
+      expect(t.supplyAmount).toBeGreaterThan(1_000_000);
+      // 여러 대 묶음이면 거래단위별로는 즉시상각 대상일 수 있다 → 1대 구입만 둔다
+      expect(t.description).not.toMatch(/[2-9]대/);
     }
   });
 
@@ -146,8 +150,9 @@ describe('종류별 내용', () => {
     expect(cancels.filter((t) => t.evidenceType === 'card')).toHaveLength(2);
     expect(cancels.filter((t) => t.evidenceType === 'cash_receipt')).toHaveLength(1);
     for (const t of cancels) {
-      const origId = /원거래 (\S+) 상쇄/.exec(t.truth.note ?? '')![1]!;
-      const orig = byId.get(origId)!;
+      const orig = byId.get(t.truth.cancelOf!)!;
+      expect(orig, t.id).toBeDefined();
+      expect(t.truth.note).toContain(orig.id);
       expect(t.totalAmount).toBe(-orig.totalAmount);
       expect(t.supplyAmount).toBe(-orig.supplyAmount);
       expect(t.vatAmount).toBe(-orig.vatAmount);

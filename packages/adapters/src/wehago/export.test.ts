@@ -358,20 +358,24 @@ describe('사전검증 (파일 생성 거부)', () => {
 });
 
 describe('일반전표 생성 → 재검증', () => {
+  // 일반전표 대상 = 매입매출 유형코드가 없는 거래 (무증빙·불공제 카드 등, 부가세 포함 전액 비용)
   function gjRows(): ExportRow[] {
     const line = (side: JournalLine['side'], code: string, name: string, amount: number): JournalLine => ({ side, accountCode: code, accountName: name, amount, memo: '테스트' });
     return [
       {
         ...psRows()[0]!,
         vatType: 'purchase_no_evidence',
-        journalLines: [line('debit', '811', '복리후생비', 9091), line('debit', '135', '부가세대급금', 909), line('credit', '253', '미지급금', 10000)],
+        journalLines: [line('debit', '811', '복리후생비', 6000), line('debit', '811', '복리후생비', 4000), line('credit', '253', '미지급금', 10000)],
       },
       {
         ...psRows()[2]!,
-        journalLines: [line('debit', '830', '소모품비', -20000), line('debit', '135', '부가세대급금', -2000), line('credit', '251', '외상매입금', -22000)],
+        vatType: 'purchase_no_evidence',
+        deductible: false,
+        journalLines: [line('debit', '830', '소모품비', -22000), line('credit', '251', '외상매입금', -22000)],
       },
       {
         ...psRows()[3]!,
+        vatType: 'purchase_no_evidence',
         journalLines: [line('debit', '813', '접대비(기업업무추진비)', 66000), line('credit', '253', '미지급금', 66000)],
       },
     ];
@@ -388,7 +392,7 @@ describe('일반전표 생성 → 재검증', () => {
     const sheet = f.sheets[0]!;
     expect(sheet.rows[0]).toEqual(['월', '일', '번호', '구분', '계정과목코드', '계정과목명', '거래처코드', '거래처명', '적요', '차변(출금)', '대변(입금)']);
     expect(sheet.rows[1]!.slice(0, 6)).toEqual(['09', '01', 1, '3', '811', '복리후생비']);
-    expect(sheet.rows.length).toBe(1 + 8);
+    expect(sheet.rows.length).toBe(1 + 7);
   });
 
   it('차변 1원 변조 → 대차 불일치 + 전송 금지', async () => {
@@ -417,5 +421,115 @@ describe('일반전표 생성 → 재검증', () => {
     const v = await verifyExportFile(buf, GJ, computeExportTotals(rows));
     expect(v.ok).toBe(true);
     expect(v.diffs.map((d) => d.code)).toEqual(['no_trace', 'not_verifiable']);
+  });
+});
+
+describe('리뷰 보강: 회계 안전 사전검증', () => {
+  it('공제 여부 미확정(null) 매입은 세액이 있으면 전송 거부, 공제 확정인데 불공(54)이면 거부', () => {
+    const rows = psRows();
+    rows[0]!.deductible = null; // 카드 과세 매입, 세액 909
+    rows[1]!.vatType = 'purchase_non_deductible';
+    rows[1]!.deductible = true;
+    const v = validateExportRows(PS, rows);
+    expect(v.ok).toBe(false);
+    const codes = v.errors.map((e) => [e.transactionId, e.code]);
+    expect(codes).toContainEqual(['tx-001', 'deductible_undecided']);
+    expect(codes).toContainEqual(['tx-002', 'deductible_conflict']);
+    // 매출·면세(세액 0) 매입은 공제 여부와 무관
+    expect(codes.filter(([id]) => id === 'tx-005')).toEqual([]);
+  });
+
+  it('부호가 섞인 행은 거부 (합계 검산이 맞아도)', () => {
+    const rows = psRows();
+    Object.assign(rows[0]!, { supplyAmount: -1000, vatAmount: 11000, totalAmount: 10000 });
+    expect(validateExportRows(PS, rows).errors.map((e) => e.code)).toContain('sign_mismatch');
+  });
+
+  it('검증되지 않은 서식은 경고로 알린다', () => {
+    const v = validateExportRows(PS, psRows());
+    expect(v.warnings.find((w) => w.code === 'unverified_template')?.message).toContain('첫 업로드');
+  });
+
+  it('일반전표: 부가세 신고 대상(유형코드 있음) 거래는 거부, 부가세 계정 줄은 경고', () => {
+    const line = (side: JournalLine['side'], code: string, name: string, amount: number): JournalLine => ({ side, accountCode: code, accountName: name, amount });
+    const rows: ExportRow[] = [
+      { ...psRows()[1]!, journalLines: [line('debit', '830', '소모품비', 100000), line('debit', '135', '부가세대급금', 10000), line('credit', '251', '외상매입금', 110000)] },
+    ];
+    const v = validateExportRows(GJ, rows);
+    expect(v.errors.map((e) => e.code)).toContain('vat_row_in_general_journal');
+    expect(v.warnings.map((w) => w.code)).toContain('vat_account_in_general_journal');
+    rows[0]!.vatType = 'purchase_no_evidence';
+    expect(validateExportRows(GJ, rows).errors.map((e) => e.code)).not.toContain('vat_row_in_general_journal');
+  });
+});
+
+describe('리뷰 보강: 재검증 게이트 (금액 외 내용·형식)', () => {
+  it('거래처코드가 숫자로 바뀌면(앞자리 0 손실) 금액이 같아도 전송 금지', async () => {
+    const rows = psRows();
+    const buf = await writeWehagoExport(PS, rows, { generatedAt: fixedDate });
+    const bad = await tamper(buf, PS.sheetName, (ws) => {
+      ws.getRow(2).getCell(colOf(PS, 'counterpartyCode')).value = 101;
+    });
+    const v = await verifyExportFile(bad, PS, computeExportTotals(rows));
+    expect(v.ok).toBe(false);
+    expect(v.diffs.filter((d) => d.blocking).map((d) => [d.code, d.transactionId])).toEqual([['row_content_mismatch', 'tx-001']]);
+  });
+
+  it('유형코드·일자 변경도 잡는다 (57 → 51, 09-01 → 08-31)', async () => {
+    const rows = psRows();
+    const buf = await writeWehagoExport(PS, rows, { generatedAt: fixedDate });
+    const bad = await tamper(buf, PS.sheetName, (ws) => {
+      ws.getRow(2).getCell(colOf(PS, 'vatTypeCode')).value = '51';
+      ws.getRow(3).getCell(colOf(PS, 'date')).value = '2026-08-31';
+    });
+    const v = await verifyExportFile(bad, PS, computeExportTotals(rows));
+    expect(v.ok).toBe(false);
+    expect(v.diffs.filter((d) => d.code === 'row_content_mismatch').map((d) => d.transactionId)).toEqual(['tx-001', 'tx-002']);
+  });
+
+  it('금액 셀이 텍스트면 값이 같아도 전송 금지', async () => {
+    const rows = psRows();
+    const buf = await writeWehagoExport(PS, rows, { generatedAt: fixedDate });
+    const bad = await tamper(buf, PS.sheetName, (ws) => {
+      ws.getRow(2).getCell(colOf(PS, 'totalAmount')).value = '10,000';
+    });
+    const v = await verifyExportFile(bad, PS, computeExportTotals(rows));
+    expect(v.ok).toBe(false);
+    const d = v.diffs.find((x) => x.code === 'unreadable_amount')!;
+    expect(d.blocking).toBe(true);
+    expect(d.message).toContain('텍스트');
+  });
+
+  it('추적 범위가 조작돼도(끝 행 10억) 멈추지 않고 전송 금지', async () => {
+    const rows = psRows();
+    const buf = await writeWehagoExport(PS, rows, { generatedAt: fixedDate });
+    const wb = new ExcelJS.Workbook();
+    await wb.xlsx.load(buf as unknown as ArrayBuffer);
+    wb.getWorksheet(TRACE_SHEET_NAME)!.getRow(3).getCell(3).value = 1_000_000_000;
+    const bad = Buffer.from((await wb.xlsx.writeBuffer()) as ArrayBuffer);
+    const t0 = Date.now();
+    const v = await verifyExportFile(bad, PS, computeExportTotals(rows));
+    expect(Date.now() - t0).toBeLessThan(2000);
+    expect(v.ok).toBe(false);
+    expect(v.diffs.map((d) => d.code)).toContain('row_content_mismatch');
+
+    wb.getWorksheet(TRACE_SHEET_NAME)!.getRow(3).getCell(3).value = 0; // 끝 < 시작
+    const bad2 = Buffer.from((await wb.xlsx.writeBuffer()) as ArrayBuffer);
+    const v2 = await verifyExportFile(bad2, PS, computeExportTotals(rows));
+    expect(v2.ok).toBe(false);
+    expect(v2.diffs.map((d) => d.code)).toContain('trace_invalid');
+  });
+
+  it('일반전표도 계정코드 변경을 잡는다', async () => {
+    const line = (side: JournalLine['side'], code: string, name: string, amount: number): JournalLine => ({ side, accountCode: code, accountName: name, amount });
+    const rows: ExportRow[] = [{ ...psRows()[0]!, vatType: 'purchase_no_evidence', journalLines: [line('debit', '811', '복리후생비', 10000), line('credit', '253', '미지급금', 10000)] }];
+    const buf = await writeWehagoExport(GJ, rows, { generatedAt: fixedDate });
+    expect((await verifyExportFile(buf, GJ, computeExportTotals(rows))).ok).toBe(true);
+    const bad = await tamper(buf, GJ.sheetName, (ws) => {
+      ws.getRow(2).getCell(colOf(GJ, 'accountCode')).value = '813';
+    });
+    const v = await verifyExportFile(bad, GJ, computeExportTotals(rows));
+    expect(v.ok).toBe(false);
+    expect(v.diffs.map((d) => d.code)).toEqual(['row_content_mismatch']);
   });
 });

@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from 'vitest';
 import type Anthropic from '@anthropic-ai/sdk';
-import { APIConnectionError, AuthenticationError, BadRequestError, InternalServerError, RateLimitError } from '@anthropic-ai/sdk';
+import { APIConnectionError, AuthenticationError, BadRequestError, InternalServerError, NotFoundError, RateLimitError } from '@anthropic-ai/sdk';
 import type { AIClassificationInput } from '@mintax/core';
 import {
   ABSTAIN_CODE,
@@ -323,5 +323,147 @@ describe('classifyAnthropicError', () => {
     expect(classifyAnthropicError(new InternalServerError(500, {}, 'x', new Headers()))).toEqual({ retryable: true, reason: 'http_500' });
     expect(classifyAnthropicError(new AuthenticationError(401, {}, 'x', new Headers()))).toEqual({ retryable: false, reason: 'auth_401' });
     expect(classifyAnthropicError(new TypeError('boom'))).toEqual({ retryable: false, reason: 'unexpected_error' });
+  });
+});
+
+describe('AnthropicProvider 안정성 (검수 보강)', () => {
+  it('연속 실패 5회 → 일시 중단(호출 생략·상태 NOT_AVAILABLE), 쿨다운 후 재개, 성공하면 복구', async () => {
+    let now = 1_000_000;
+    let ok = false;
+    const calls: number[] = [];
+    const client: MessagesClient = {
+      messages: {
+        create: () => {
+          calls.push(now);
+          return ok
+            ? Promise.resolve(message([toolUse({ accountCode: '822', confidence: 70, rationale: '주유' })]))
+            : Promise.reject(new InternalServerError(529, {}, 'overloaded', new Headers()));
+        },
+      },
+    };
+    const { p, events } = provider(client, { maxRetries: 0, breakerThreshold: 5, breakerCooldownMs: 60_000, now: () => now });
+    expect(p.status().statusReason).toContain('연결 미확인');
+    for (let i = 0; i < 5; i++) expect(await p.classifyTransaction(input())).toBeNull();
+    expect(calls).toHaveLength(5);
+    expect(p.circuitOpen).toBe(true);
+    expect(p.status()).toMatchObject({ status: 'NOT_AVAILABLE' });
+    expect(p.status().statusReason).toContain('일시 중단');
+    expect(p.status().statusReason).toContain('60초');
+
+    // 중단 중에는 네트워크 호출 없이 즉시 null
+    for (let i = 0; i < 100; i++) expect(await p.classifyTransaction(input())).toBeNull();
+    expect(calls).toHaveLength(5);
+    expect(events.filter((e) => e.type === 'skipped')).toHaveLength(100);
+
+    // 쿨다운 후 한 번 시도 → 또 실패하면 바로 다시 중단
+    now += 60_001;
+    expect(p.circuitOpen).toBe(false);
+    expect(await p.classifyTransaction(input())).toBeNull();
+    expect(calls).toHaveLength(6);
+    expect(p.circuitOpen).toBe(true);
+
+    // 쿨다운 후 성공 → 정상 복구
+    now += 60_001;
+    ok = true;
+    expect((await p.classifyTransaction(input()))?.accountCode).toBe('822');
+    expect(p.circuitOpen).toBe(false);
+    expect(p.status()).toMatchObject({ status: 'LIVE' });
+    expect(p.status().statusReason).toContain('최근 호출 성공');
+  });
+
+  it('breakerThreshold 0 이면 일시 중단하지 않는다, 최근 실패는 상태 사유에 남는다', async () => {
+    const { client, calls } = fakeClient(fail(new InternalServerError(500, {}, 'x', new Headers())));
+    const { p } = provider(client, { maxRetries: 0, breakerThreshold: 0 });
+    for (let i = 0; i < 8; i++) await p.classifyTransaction(input());
+    expect(calls).toHaveLength(8);
+    expect(p.status()).toMatchObject({ status: 'LIVE' });
+    expect(p.status().statusReason).toContain('최근 호출 실패(http_500)');
+  });
+
+  it('모델 없음(404) → 설정 오류로 보고 NOT_AVAILABLE, 이후 호출 중단', async () => {
+    const { client, calls } = fakeClient(fail(new NotFoundError(404, {}, 'model: claude-x', new Headers())));
+    const { p, events } = provider(client, { model: 'claude-x' });
+    expect(await p.classifyTransaction(input())).toBeNull();
+    expect(await p.classifyTransaction(input())).toBeNull();
+    expect(calls).toHaveLength(1);
+    expect(events.find((e) => e.type === 'failure')).toEqual({ type: 'failure', op: 'classify', attempt: 1, reason: 'not_found_404' });
+    expect(p.enabled).toBe(false);
+    expect(p.status()).toMatchObject({ status: 'NOT_AVAILABLE', statusReason: '모델 claude-x 을(를) 찾을 수 없음 — AI_MODEL 을 확인하세요' });
+  });
+
+  it('형식이 깨진 입력·클라이언트 동기 예외에도 throw 하지 않고 null', async () => {
+    const { client } = fakeClient(reply(message([toolUse({ accountCode: '822', confidence: 70, rationale: 'x' })])));
+    const { p, events } = provider(client);
+    expect(await p.classifyTransaction(input({ totalAmount: undefined as unknown as number }))).toBeNull();
+    expect(events.at(-1)).toEqual({ type: 'failure', op: 'classify', attempt: 0, reason: 'unexpected_error' });
+    expect(await p.classifyTransaction(null as unknown as AIClassificationInput)).toBeNull();
+    const throwing: MessagesClient = {
+      messages: {
+        create: () => {
+          throw new TypeError('sync boom');
+        },
+      },
+    };
+    expect(await provider(throwing).p.classifyTransaction(input())).toBeNull();
+  });
+
+  it('요약 단계 예외가 나도 휴리스틱 검토 결과는 그대로 반환', async () => {
+    const { client } = fakeClient(reply(message([{ type: 'text', text: '요약' }], 'end_turn')));
+    const { p } = provider(client);
+    const base: LedgerReviewInput = {
+      clientId: 'c1',
+      clientName: 'x',
+      industry: 'service',
+      period: '2026-09',
+      monthly: [
+        { period: '2026-08', sales: 50_000_000, purchases: 32_000_000, byAccount: {} },
+        { period: '2026-09', sales: 56_000_000, purchases: 47_040_000, byAccount: {} },
+      ],
+    };
+    // 비정상 월 요약(null 항목)이 섞여도 요약 페이로드 생성에서 예외가 나지 않는다
+    const r = await p.reviewLedger({ ...base, monthly: [...base.monthly, null as unknown as LedgerReviewInput['monthly'][number]] });
+    expect(r.map((a) => a.code)).toEqual(['REV-PURCHASE-SPIKE', 'AI-NARRATIVE']);
+    const bad = new AnthropicProvider({
+      client,
+      retryDelayMs: 0,
+      fallback: {
+        name: 'h',
+        model: null,
+        status: () => ({ key: 'h', name: 'h', status: 'MOCK', statusReason: '', capabilities: [] }),
+        classifyTransaction: async () => null,
+        // 요약 페이로드를 만들 때 detail 접근에서 예외
+        reviewLedger: async () => [
+          {
+            code: 'X',
+            clientId: 'c1',
+            title: 't',
+            severity: 'info' as const,
+            get detail(): string {
+              throw new Error('boom');
+            },
+          },
+        ],
+        detectAnomaly: async () => [],
+        explainClassification: async () => '',
+        suggestRule: async () => [],
+      },
+    });
+    const r2 = await bad.reviewLedger(base);
+    expect(r2.map((a) => a.code)).toEqual(['X']);
+  });
+
+  it('잘못된 숫자 옵션(NaN·음수)은 기본값으로, 상한은 85 를 넘지 않는다', async () => {
+    const { client, calls } = fakeClient(reply(message([toolUse({ accountCode: '822', confidence: 99, rationale: 'x' })])));
+    const p = new AnthropicProvider({ client, confidenceCap: Number.NaN, timeoutMs: -5, maxRetries: Number.NaN, retryDelayMs: 0 });
+    expect((await p.classifyTransaction(input()))?.confidence).toBe(85);
+    expect(calls[0]!.opts?.timeout).toBe(10_000);
+    const high = new AnthropicProvider({ client, confidenceCap: 99 });
+    expect((await high.classifyTransaction(input()))?.confidence).toBe(85);
+    const low = new AnthropicProvider({ client, confidenceCap: 40 });
+    expect((await low.classifyTransaction(input()))?.confidence).toBe(40);
+  });
+
+  it('classifyAnthropicError: 404 는 재시도하지 않는다', () => {
+    expect(classifyAnthropicError(new NotFoundError(404, {}, 'x', new Headers()))).toEqual({ retryable: false, reason: 'not_found_404' });
   });
 });

@@ -624,8 +624,9 @@ function compareWehago(input: ReconcileInput, units: readonly Unit[], fileMode: 
       date: r.date,
       merchantName: r.merchantName,
       amount: r.totalAmount,
-      blocking: false,
-      message: `WEHAGO에만 있는 전표입니다: ${label(r.date, r.merchantName, r.totalAmount)} (WEHAGO에서 직접 입력·수집한 전표인지 확인하세요).`,
+      // WEHAGO T 자동전표처리가 같은 증빙을 따로 수집했을 수 있다 → 이중기장 위험이므로 차단하고 사람이 확인한다
+      blocking: true,
+      message: `WEHAGO에만 있는 전표입니다: ${label(r.date, r.merchantName, r.totalAmount)} — WEHAGO 자동수집과 이중기장됐을 수 있습니다. WEHAGO에서 직접 입력한 전표가 맞는지 확인하세요.`,
     });
   });
   return { totals, discrepancies: out };

@@ -20,12 +20,15 @@ describe('@mintax/adapters 공개 API', () => {
       'buildErrorReportXlsx',
       'importTabularFile',
       'previewImport',
+      'checkTraceIntegrity',
     ] as const) {
       expect(typeof adapters[name]).toBe('function');
     }
     expect(adapters.FORMAT_PROFILES.length).toBeGreaterThanOrEqual(7);
     expect(adapters.WEHAGO_TEMPLATES.map((t) => t.kind)).toEqual(['purchase_sales', 'general_journal', 'payroll_earned', 'payroll_business', 'payroll_daily']);
     expect(adapters.INTEGRATIONS.length).toBeGreaterThan(10);
+    expect(adapters.IMPLEMENTED_COMPONENTS.desktopBridge).toBe(false);
+    expect(adapters.DEFAULT_CLIENT_CONFLICT_MIN_CONFIDENCE).toBe(90);
     expect(adapters.LEGACY_XLS_MESSAGE).toBe('구형 .xls 형식입니다. Excel에서 .xlsx로 저장 후 올려주세요.');
   });
 });

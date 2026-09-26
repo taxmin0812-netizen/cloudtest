@@ -178,6 +178,8 @@ export interface GroundTruth {
   duplicateOf?: string;
   /** 중복 의심 상대 id (실제로는 별개 거래) */
   possibleDuplicateOf?: string;
+  /** 취소(음수) 거래가 상쇄하는 원거래 id */
+  cancelOf?: string;
   /** 이력: 사람이 엔진 추천을 수정해 확정한 거래 */
   corrected?: boolean;
   note?: string;

@@ -42,4 +42,16 @@ describe('buildErrorReportXlsx', () => {
     const empty = await readTabularFile(await buildErrorReportXlsx([]), 'x.xlsx');
     expect(empty.sheets[0]!.rows[1]![1]).toBe('오류 항목이 없습니다.');
   });
+
+  it('긴 원본데이터는 엑셀 셀 한도 안으로 자르고, 사유 속 민감정보도 가린다', async () => {
+    const buf = await buildErrorReportXlsx([
+      { sourceRowNumber: 1, reason: '공급가액 금액 형식 오류: "900101-1234567"', rawData: { 메모: 'x'.repeat(40_000) } },
+    ]);
+    const f = await readTabularFile(buf, 'e.xlsx');
+    const row = f.sheets[0]!.rows[1]!;
+    expect(String(row[1])).toContain('900101-1******');
+    expect(String(row[1])).not.toContain('1234567');
+    expect(String(row[3]).length).toBeLessThan(32_767);
+    expect(String(row[3])).toContain('생략');
+  });
 });

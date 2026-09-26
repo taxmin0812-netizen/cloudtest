@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { findIntegration, getIntegrationStatuses, INTEGRATIONS, RESEARCH_CONFIRMED_APIS } from './integrations';
+import { findIntegration, getIntegrationStatuses, IMPLEMENTED_COMPONENTS, INTEGRATIONS, RESEARCH_CONFIRMED_APIS } from './integrations';
 
 const statusOf = (env: Record<string, string | undefined>, key: string) => getIntegrationStatuses(env).find((d) => d.key === key)!;
 
@@ -16,7 +16,9 @@ describe('연동 레지스트리', () => {
     expect(s['wehago.purchase_sales_file']).toBe('FILE_BASED');
     expect(s['wehago.general_journal_file']).toBe('FILE_BASED');
     expect(s['wehago.payroll_file']).toBe('MOCK');
-    expect(s['desktop_bridge']).toBe('FILE_BASED');
+    // Bridge·폴더 감시는 아직 구현되지 않았다 → 정직하게 NOT_AVAILABLE
+    expect(s['desktop_bridge']).toBe('NOT_AVAILABLE');
+    expect(s['download_watch']).toBe('NOT_AVAILABLE');
     expect(s['cloud_folder']).toBe('NOT_AVAILABLE');
     expect(s['ai_provider.heuristic']).toBe('LIVE');
     expect(s['ai_provider.anthropic']).toBe('NOT_AVAILABLE');
@@ -39,10 +41,18 @@ describe('연동 레지스트리', () => {
     expect(statusOf({ AI_PROVIDER: 'heuristic', ANTHROPIC_API_KEY: 'sk-x' }, 'ai_provider.anthropic').status).toBe('NOT_AVAILABLE');
   });
 
-  it('클라우드 폴더는 경로 설정 시 FILE_BASED, Bridge 비밀키 없으면 사유에 표시', () => {
-    expect(statusOf({ CLOUD_FOLDER_PATH: '/mnt/nas/inbox' }, 'cloud_folder').status).toBe('FILE_BASED');
-    expect(statusOf({}, 'desktop_bridge').statusReason).toContain('BRIDGE_SHARED_SECRET');
-    expect(statusOf({ BRIDGE_SHARED_SECRET: 's' }, 'desktop_bridge').statusReason).not.toContain('BRIDGE_SHARED_SECRET');
+  it('미구현 구성요소는 환경변수가 있어도 FILE_BASED 로 표시하지 않는다 (가짜 성공 금지)', () => {
+    expect(IMPLEMENTED_COMPONENTS).toEqual({ desktopBridge: false, cloudFolderWatcher: false });
+    const cf = statusOf({ CLOUD_FOLDER_PATH: '/mnt/nas/inbox' }, 'cloud_folder');
+    expect(cf.status).toBe('NOT_AVAILABLE');
+    expect(cf.statusReason).toContain('구현되지 않아');
+    const br = statusOf({ BRIDGE_SHARED_SECRET: 's' }, 'desktop_bridge');
+    expect(br.status).toBe('NOT_AVAILABLE');
+    expect(br.statusReason).toContain('미구현');
+    expect(br.capabilities).toEqual([]);
+    // 어떤 환경에서도 '주기적으로 확인' 같은 동작 주장이 나오지 않는다
+    const all = getIntegrationStatuses({ CLOUD_FOLDER_PATH: '/x', CLOUD_FOLDER_S3_PREFIX: 's3://b/p', BRIDGE_SHARED_SECRET: 's' });
+    for (const d of all.filter((x) => x.group === 'bridge' || x.group === 'cloud')) expect(d.status).toBe('NOT_AVAILABLE');
   });
 
   it('원본 레지스트리는 변경되지 않는다 (복사본 반환)', () => {

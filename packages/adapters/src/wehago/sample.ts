@@ -104,7 +104,9 @@ export function buildTemplateFromSample(headerRow: readonly unknown[], opts: Tem
   const unmatchedHeaders = columns.filter((c) => c.field === null && c.header !== '').map((c) => c.header);
   if (unmatchedHeaders.length > 0) warnings.push(`MIN TAX OPS 가 채우지 않는 열(빈칸 출력): ${unmatchedHeaders.join(', ')}`);
   if (missingRequired.length > 0) warnings.push(`필수 항목을 서식에서 찾지 못했습니다: ${missingRequired.join(', ')} — 열 매핑을 직접 지정해야 합니다.`);
-  if (opts.sampleRow) warnings.push('제목 아래 샘플 행을 그대로 유지합니다 (WEHAGO 가 첫 행 샘플을 반영하지 않는 서식으로 가정 — 확인 필요).');
+  if (opts.sampleRow) {
+    warnings.push('제목 아래 샘플 행을 그대로 유지합니다 (WEHAGO 가 첫 행 샘플을 반영하지 않는 서식으로 가정 — 확인 필요). 재검증은 샘플 행이 서식 원본과 같은지만 확인합니다.');
+  }
 
   const baseCol = new Map(base.columns.map((c) => [c.field, c]));
   const templateColumns: TemplateColumn[] = columns.map((c) => {
@@ -121,11 +123,13 @@ export function buildTemplateFromSample(headerRow: readonly unknown[], opts: Tem
     preambleRows: opts.preambleRows ?? [],
     sampleRow: opts.sampleRow ?? null,
     status: 'office_sample',
-    verified: missingRequired.length === 0,
+    // 열 제목이 맞아도 유형코드 입력 형식(57 vs 카과)·전자여부 값·일자 형식·샘플행 처리는 아직 확인 전이다.
+    // 자동으로 verified=true 로 올리지 않는다 — 첫 업로드 결과(WEHAGO 화면 건수·금액)를 사람이 확인한 뒤 바꾼다.
+    verified: false,
     note:
       `사무소 WEHAGO 서식에서 생성 (${matched.size}/${trimmed.length}열 매핑). ` +
       (missingRequired.length ? `누락 필수: ${missingRequired.join(', ')}. ` : '') +
-      '첫 업로드 결과를 확인한 뒤 사용하세요.',
+      '검증필요: 유형코드·전자여부·일자 입력 형식은 표준값을 쓴다. 첫 업로드 후 WEHAGO 화면의 건수·금액을 확인하고 verified 로 바꾸세요.',
     docsRef: base.docsRef,
   };
   const confidence = required.length === 0 ? 100 : Math.round(((required.length - missingRequired.length) / required.length) * 100);
@@ -167,5 +171,7 @@ export async function buildTemplateFromSampleFile(
     sampleRow: opts.sampleRow !== undefined ? opts.sampleRow : sampleRow,
     sourceFileName: opts.sourceFileName ?? fileName,
   });
+  // 시트 이름도 서식 그대로 (WEHAGO 가 시트 이름을 확인하는지 미확인 — 원본을 따르는 쪽이 안전)
+  if (sheet.name.trim()) result.template.sheetName = sheet.name;
   return { ...result, sheetName: sheet.name, headerRowIndex: bestRow };
 }

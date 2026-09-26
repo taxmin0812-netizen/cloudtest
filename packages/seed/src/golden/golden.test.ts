@@ -36,6 +36,19 @@ describe('골든 데이터셋', () => {
     }
   });
 
+  it('중복 의심·취소 거래의 원거래도 골든에 있다 (같은 배치에서만 판정 가능)', () => {
+    const ids = new Set(golden.items.map((i) => i.id));
+    let refs = 0;
+    for (const { transaction: t } of golden.items) {
+      for (const ref of [t.truth.possibleDuplicateOf, t.truth.cancelOf]) {
+        if (!ref) continue;
+        refs += 1;
+        expect(ids.has(ref), `${t.id} → ${ref}`).toBe(true);
+      }
+    }
+    expect(refs).toBe(ANOMALY_SPECS.possible_duplicate.count + ANOMALY_SPECS.cancel_negative.count);
+  });
+
   it('모든 거래처가 들어가고 거래처 정보가 붙어 있다', () => {
     expect(Object.keys(golden.expected.byClient).sort()).toEqual(ds.clients.map((c) => c.code).sort());
     for (const it of golden.items) {

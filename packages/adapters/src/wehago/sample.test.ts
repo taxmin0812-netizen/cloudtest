@@ -53,7 +53,9 @@ describe('buildTemplateFromSample', () => {
     expect(r.missingRequired).toEqual([]);
     expect(r.confidence).toBe(100);
     expect(r.template.status).toBe('office_sample');
-    expect(r.template.verified).toBe(true);
+    // 열이 모두 맞아도 자동으로 검증됨 처리하지 않는다 (첫 업로드 확인 전)
+    expect(r.template.verified).toBe(false);
+    expect(r.template.note).toContain('첫 업로드');
     expect(r.template.version).toBe('20260926');
     expect(r.template.columns.map((c) => c.header)).toEqual(OFFICE_HEADER);
     expect(validateTemplate(r.template)).toEqual([]);
@@ -117,6 +119,18 @@ describe('buildTemplateFromSampleFile', () => {
     const v = await verifyExportFile(buf, r.template, computeExportTotals([row]));
     expect(v.ok).toBe(true);
     expect(v.actual.count).toBe(1);
+    expect(r.template.sheetName).toBe('매입매출');
+    // 샘플 행은 검증 대상이 아니지만 숨기지 않고 알린다
+    expect(v.diffs.find((d) => d.code === 'sample_row_present')?.blocking).toBe(false);
+
+    // 샘플 행이 바뀌면(금액 등) 전송 금지 — 검증이 건너뛰는 행이라 더 엄격하게
+    const wb2 = new ExcelJS.Workbook();
+    await wb2.xlsx.load(buf as unknown as ArrayBuffer);
+    wb2.worksheets[0]!.getRow(3).getCell(9).value = 999999;
+    const bad = Buffer.from((await wb2.xlsx.writeBuffer()) as ArrayBuffer);
+    const v2 = await verifyExportFile(bad, r.template, computeExportTotals([row]));
+    expect(v2.ok).toBe(false);
+    expect(v2.diffs.map((d) => d.code)).toContain('sample_row_changed');
   });
 
   it('제목행을 못 찾으면 거부', async () => {

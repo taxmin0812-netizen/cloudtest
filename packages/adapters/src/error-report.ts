@@ -9,6 +9,13 @@ import { looksLikeResidentNumber, maskResidentLike, scrubFreeText } from './util
 
 export const ERROR_REPORT_HEADERS = ['행번호', '사유', '필드', '원본데이터'] as const;
 
+/** 엑셀 셀 최대 글자 수는 32,767자 — 넘으면 Excel 이 파일 복구 대화상자를 띄운다 */
+const MAX_CELL_CHARS = 32_000;
+
+function fitCell(s: string): string {
+  return s.length <= MAX_CELL_CHARS ? s : `${s.slice(0, MAX_CELL_CHARS)} …(이하 ${(s.length - MAX_CELL_CHARS).toLocaleString('ko-KR')}자 생략)`;
+}
+
 export interface ErrorReportOptions {
   /** 시트 위 제목 (예: "카드사용내역_202609.xlsx 오류 항목") — 없으면 제목행 없이 바로 표 */
   title?: string;
@@ -59,10 +66,9 @@ export async function buildErrorReportXlsx(failures: readonly NormalizationFailu
     // 행번호: 원본 파일에서 바로 찾을 수 있도록 실제 엑셀 행(rawData.__row)을 우선 표시
     const excelRow = typeof f.rawData?.__row === 'number' ? (f.rawData.__row as number) : f.sourceRowNumber;
     row.getCell(1).value = excelRow;
-    row.getCell(2).value = f.reason;
+    row.getCell(2).value = fitCell(scrubFreeText(f.reason));
     row.getCell(3).value = f.field ? fieldLabel(f.field) : '';
-    const raw = rawSummary(f.rawData ?? {});
-    row.getCell(4).value = raw;
+    row.getCell(4).value = fitCell(rawSummary(f.rawData ?? {}));
     row.getCell(4).alignment = { wrapText: false };
   }
   if (sorted.length === 0) {

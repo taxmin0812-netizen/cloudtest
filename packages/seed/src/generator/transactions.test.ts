@@ -5,7 +5,7 @@ import { generateDataset } from './index';
 import { SCENARIO_A_CODE, SCENARIO_PAYROLL_CODE, SPIKE_CLIENT_CODE } from './clients';
 import { fileKindOf } from './files';
 import { isSyntheticBusinessNumber } from './ids';
-import { truthAccountFor } from './merchants';
+import { acquisitionCostOf, truthAccountFor } from './merchants';
 import {
   CURRENT_MONTH,
   HISTORY_MONTHS,
@@ -48,7 +48,7 @@ describe('기간·상태·볼륨', () => {
     for (const t of all) if (isCardPurchase(t)) counts.set(`${t.clientCode}|${t.period}`, (counts.get(`${t.clientCode}|${t.period}`) ?? 0) + 1);
     expect(counts.size).toBe(ds.clients.length * 7);
     for (const [k, n] of counts) {
-      expect(n, k).toBeGreaterThanOrEqual(45);
+      expect(n, k).toBeGreaterThanOrEqual(50);
       expect(n, k).toBeLessThanOrEqual(600);
     }
   });
@@ -173,7 +173,8 @@ describe('정답 레이블', () => {
       if (t.clientCode === SPIKE_CLIENT_CODE && t.truth.accountCode === '813') continue;
       if (t.clientCode === SCENARIO_PAYROLL_CODE && t.merchantName === '쿠팡') continue;
       const m = merchantById.get(t.merchantId)!;
-      if (t.truth.accountCode !== truthAccountFor(m.kind, clientByCode.get(t.clientCode)!.industry, t.totalAmount)) bad.push(t.id);
+      const c = clientByCode.get(t.clientCode)!;
+      if (t.truth.accountCode !== truthAccountFor(m.kind, c.industry, t.totalAmount, acquisitionCostOf(t, c.vatType))) bad.push(t.id);
       checked += 1;
     }
     expect(bad).toEqual([]);

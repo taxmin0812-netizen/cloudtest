@@ -200,3 +200,55 @@ describe('열 매핑 유틸', () => {
     }
   });
 });
+
+describe('리뷰 보강: 구조가 파일명 힌트보다 우선', () => {
+  it('세금계산서 목록을 "계산서"·"면세" 파일명으로 올려도 세금계산서로 판정 (영세율 오분류 방지)', () => {
+    const rows = taxInvoiceRows().slice(5); // 제목 없이 헤더부터
+    for (const fileName of ['매입_계산서_202609.xlsx', '면세.xlsx']) {
+      const d = detectFormat(rows, { fileName });
+      expect(d.profile.id, fileName).toBe('hometax_tax_invoice_v1');
+      expect(d.candidates.map((c) => c.profileId)).not.toContain('hometax_invoice_exempt_v1');
+    }
+  });
+
+  it('전자계산서 목록을 "세금계산서" 파일명으로 올려도 면세 계산서로 판정', () => {
+    const d = detectFormat(exemptInvoiceRows().slice(5), { fileName: '세금계산서_매입.xlsx' });
+    expect(d.profile.id).toBe('hometax_invoice_exempt_v1');
+    expect(d.requiresUserMapping).toBe(false);
+  });
+
+  it('필수 열이 빠진 후보는 힌트 점수로 완비된 후보를 이기지 못한다', () => {
+    // 분류 열이 없어 구조로만 가리기 어려운 경우: 세액 열 없는 목록 + 세금계산서 힌트 → 필수(세액)가 빠진 세금계산서보다 면세가 우선
+    const header = ['작성일자', '승인번호', '공급자사업자등록번호', '상호', '공급받는자사업자등록번호', '상호', '합계금액', '공급가액'];
+    const d = detectFormat([header], { fileName: '전자세금계산서.xlsx' });
+    expect(d.profile.id).toBe('hometax_invoice_exempt_v1');
+    expect(d.missingFields).toEqual([]);
+  });
+});
+
+describe('리뷰 보강: 여러 시트', () => {
+  it('선택되지 않은 거래자료 시트를 알려 주고, 시트를 지정해 판정할 수 있다', async () => {
+    const buf = await toXlsxBuffer([
+      { name: '카드', rows: cardPurchaseRows() },
+      { name: '현금영수증', rows: cashReceiptRows() },
+      { name: '메모', rows: [['안녕하세요']] },
+    ]);
+    const file = await readTabularFile(buf, 'x.xlsx');
+    const r = detectFormatInFile(file);
+    expect(r.otherDataSheets.map((o) => o.sheetName)).toHaveLength(1);
+    const other = r.otherDataSheets[0]!;
+    expect(file.sheets[other.sheetIndex]!.name).not.toBe(r.sheetName);
+    const forced = detectFormatInFile(file, { sheetIndex: other.sheetIndex });
+    expect(forced.sheetName).toBe(other.sheetName);
+    expect(forced.detection.profile.id).toBe(other.profileId);
+    expect(() => detectFormatInFile(file, { sheetIndex: 9 })).toThrowError(/시트 번호/);
+  });
+});
+
+
+describe('자동 적재 기준 설정', () => {
+  it('minAutoConfidence 를 올리면 같은 파일도 사용자 확인을 요구한다', () => {
+    expect(detectFormat(cardPurchaseRows()).requiresUserMapping).toBe(false);
+    expect(detectFormat(cardPurchaseRows(), { minAutoConfidence: 101 }).requiresUserMapping).toBe(true);
+  });
+});

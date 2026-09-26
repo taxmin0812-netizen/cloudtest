@@ -82,3 +82,43 @@ describe('adapters normalizeRows 로 끝까지 읽기 (행 회계·금액)', () 
     for (const t of res.transactions) expect(t.direction).toBe(f.kind.endsWith('sales') ? 'sales' : 'purchase');
   });
 });
+
+describe('파일 경로 중복 판정 (adapters normalizeRows → core fingerprint)', () => {
+  const CLIENT_ID = '22222222-2222-4222-8222-222222222222';
+  const normalize = (code: string, kind: string, channel: 'hometax_file' | 'desktop_bridge') => {
+    const f = files.find((x) => x.clientCode === code && x.kind === kind)!;
+    const client = ds.clients.find((c) => c.code === code)!;
+    const det = detectFormat(f.rows, { fileName: f.fileName });
+    const res = normalizeRows(det, f.rows, { clientId: CLIENT_ID, businessNumber: client.businessNumber, channel, clientVatType: client.vatType });
+    const fpById = new Map(res.transactions.map((t) => [f.rowIds[t.sourceRowNumber! - 1]!, t.fingerprint]));
+    return { res, fpById };
+  };
+
+  const dupClients = [...new Set(ds.current.filter((t) => t.anomalies.includes('exact_duplicate')).map((t) => t.clientCode))];
+
+  it.each(dupClients)('%s: 재전송 파일의 완전중복 행은 원본 파일의 원거래와 fingerprint 가 같다', (code) => {
+    const orig = normalize(code, 'card_purchase', 'hometax_file');
+    const resend = normalize(code, 'card_purchase_resend', 'desktop_bridge');
+    expect(resend.fpById.size).toBeGreaterThan(0);
+    for (const [id, fp] of resend.fpById) {
+      const origId = ds.current.find((t) => t.id === id)!.truth.duplicateOf!;
+      expect(orig.fpById.get(origId), `${id} → ${origId}`).toBe(fp);
+    }
+  });
+
+  const possibleClients = [...new Set(ds.current.filter((t) => t.anomalies.includes('possible_duplicate')).map((t) => t.clientCode))];
+
+  it.each(possibleClients)('%s: 중복 의심 행은 원거래와 fingerprint 가 달라 별개 거래로 남고, 경고가 붙는다', (code) => {
+    const { res, fpById } = normalize(code, 'card_purchase', 'hometax_file');
+    const fps = res.transactions.map((t) => t.fingerprint);
+    expect(new Set(fps).size).toBe(fps.length);
+    for (const t of ds.current.filter((x) => x.clientCode === code && x.anomalies.includes('possible_duplicate'))) {
+      const a = fpById.get(t.id);
+      const b = fpById.get(t.truth.possibleDuplicateOf!);
+      expect(a).toBeDefined();
+      expect(b).toBeDefined();
+      expect(a).not.toBe(b);
+    }
+    expect(res.warnings.some((w) => w.code === 'possible_duplicate')).toBe(true);
+  });
+});

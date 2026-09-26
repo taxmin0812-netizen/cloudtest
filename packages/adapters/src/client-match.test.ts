@@ -64,3 +64,11 @@ describe('detectClientFromFile', () => {
     expect(r.candidates).toEqual([]);
   });
 });
+
+describe('판정 기준 설정', () => {
+  it('모호 판정 기준을 사무소 설정으로 조정할 수 있다', () => {
+    const input = { rows: cardPurchaseRows(), fileName: `${CLIENT.businessNumber}_카드.xlsx` };
+    expect(detectClientFromFile(input, clients).ambiguous).toBe(false);
+    expect(detectClientFromFile(input, clients, { ambiguousBelow: 95 }).ambiguous).toBe(true);
+  });
+});

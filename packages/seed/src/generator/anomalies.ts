@@ -46,7 +46,7 @@ export const ANOMALY_SPECS: Readonly<Record<AnomalyKind, { count: number; label:
   },
   asset_purchase: {
     count: 3, label: '고액 자산 구입', clients: ['C001', 'C012', 'C022'],
-    description: '노트북 2,300,000원 등 100만원 이상 비품 구입 → 212 비품 (자산 가능성)',
+    description: '노트북 2,300,000원 등 1대당 취득가액 100만원 초과 비품 구입 → 212 비품 (자산 가능성)',
   },
   entertainment: {
     count: 5, label: '접대 관련', clients: ['C011', 'C020', 'C009', 'C020', 'C006'],
@@ -179,7 +179,8 @@ export function injectAnomalies(
     push({
       ...rest,
       channel: 'desktop_bridge',
-      rawData: { ...orig.rawData, 승인번호: orig.approvalNumber },
+      // 같은 원본 행이 그대로 다시 들어온다 (홈택스 카드 엑셀에는 승인번호 열이 없다 — 재전송 파일도 같은 14열)
+      rawData: { ...orig.rawData },
       truth: { ...orig.truth, expectedStatus: 'duplicate', duplicateOf: orig.id, expectedBuckets: ['duplicate'] },
       anomalies: ['exact_duplicate'],
       scenarioTags: [],
@@ -234,7 +235,8 @@ export function injectAnomalies(
   const assets: Array<{ code: string; merchant: string; evidence: 'card' | 'tax_invoice'; amount: Won; description: string; day: number }> = [
     { code: 'C001', merchant: '롯데하이마트 역삼점', evidence: 'card', amount: 2_300_000, description: '노트북', day: 9 },
     { code: 'C012', merchant: '삼성디지털프라자 판교점', evidence: 'tax_invoice', amount: 3_500_000, description: '서버 랙 장비', day: 14 },
-    { code: 'C022', merchant: '전자랜드 가산점', evidence: 'card', amount: 1_980_000, description: '모니터 4대', day: 21 },
+    // 거래단위(1대)별 취득가액이 100만원을 넘어야 즉시상각 대상이 아니다 (법인세법 시행령 제31조④⑤)
+    { code: 'C022', merchant: '전자랜드 가산점', evidence: 'card', amount: 1_980_000, description: '영상편집용 PC 1대', day: 21 },
   ];
   assets.forEach((a, i) => {
     const rng = rngOf('asset', a.code, i);
@@ -441,7 +443,7 @@ export function injectAnomalies(
         description: orig.description,
         accountCode: orig.truth.accountCode,
         anomalies: ['cancel_negative'],
-        truthExtra: { note: `취소 — 원거래 ${orig.id} 상쇄` },
+        truthExtra: { cancelOf: orig.id, note: `취소 — 원거래 ${orig.id} 상쇄` },
       }),
     );
   });

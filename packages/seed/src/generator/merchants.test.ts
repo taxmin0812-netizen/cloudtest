@@ -4,6 +4,8 @@ import { describe, expect, it } from 'vitest';
 import { isSyntheticBusinessNumber } from './ids';
 import {
   ACCOUNT_MAPPING_EXAMPLES,
+  ASSET_THRESHOLD,
+  acquisitionCostOf,
   MERCHANT_SPECS,
   RESERVED_MERCHANT_NAMES,
   SYNTHETIC_USD_KRW,
@@ -80,8 +82,25 @@ describe('merchants', () => {
     expect(truthAccountFor('ecommerce_market', 'construction', 50_000)).toBe('830');
     expect(truthAccountFor('ecommerce_market', 'ecommerce', 50_000)).toBe('146');
     expect(truthAccountFor('ecommerce_market', 'design', 999_999)).toBe('830');
-    expect(truthAccountFor('ecommerce_market', 'design', 1_000_000)).toBe('212');
     expect(truthAccountFor('ecommerce_market', 'design', -1_450_000)).toBe('212');
+  });
+
+  it('즉시상각 경계: 취득가액 100만원 이하는 비용, 초과는 자산 (법인세법 시행령 제31조④)', () => {
+    expect(ASSET_THRESHOLD).toBe(1_000_000);
+    expect(truthAccountFor('ecommerce_market', 'design', 1_000_000)).toBe('830');
+    expect(truthAccountFor('ecommerce_market', 'design', 1_000_001)).toBe('212');
+    expect(truthAccountFor('electronics', 'it_service', 1_000_000)).toBe('830');
+    expect(truthAccountFor('electronics', 'it_service', 1_000_010)).toBe('212');
+    expect(truthAccountFor('hardware_tools', 'construction', 1_000_000)).toBe('830');
+    expect(truthAccountFor('hardware_tools', 'construction', 1_200_000)).toBe('210');
+    // 합계 1,017,000원(공급가액 924,545원): 일반과세 수임처는 공급가액 기준 → 비용, 면세·간이 수임처는 합계 기준 → 자산
+    const t = { supplyAmount: 924_545, totalAmount: 1_017_000 };
+    expect(acquisitionCostOf(t, 'general')).toBe(924_545);
+    expect(acquisitionCostOf(t, 'mixed')).toBe(924_545);
+    expect(acquisitionCostOf(t, 'exempt')).toBe(1_017_000);
+    expect(acquisitionCostOf(t, 'simplified')).toBe(1_017_000);
+    expect(truthAccountFor('furniture', 'design', t.totalAmount, acquisitionCostOf(t, 'general'))).toBe('830');
+    expect(truthAccountFor('furniture', 'clinic', t.totalAmount, acquisitionCostOf(t, 'exempt'))).toBe('212');
   });
 
   it('모든 종류 × 업종 정답 계정이 계정표에 있다 (core DEFAULT_ACCOUNT_CODES 와 이름 일치)', () => {

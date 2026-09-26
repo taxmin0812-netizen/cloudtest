@@ -47,6 +47,8 @@ export interface DetectOptions {
   profiles?: readonly FormatProfile[];
   /** 헤더 탐색 행 수 (기본: 프로필 값, 보통 30) */
   scanRows?: number;
+  /** 이 신뢰도 미만이면 사용자 열 확인 요구 (기본 MIN_AUTO_CONFIDENCE=60, 사무소 설정으로 조정) */
+  minAutoConfidence?: number;
 }
 
 /** 이 신뢰도 미만이면 자동 적재하지 않고 사용자 확인을 요구한다 */
@@ -285,7 +287,7 @@ export function detectFormat(rows: readonly (readonly unknown[])[], opts: Detect
     columnMap: top.map,
     headerFingerprint: fp,
     fingerprintKnown: top.profile.knownHeaderFingerprints.includes(fp),
-    requiresUserMapping: top.profile.requiresUserMapping || confidence < MIN_AUTO_CONFIDENCE || missing.length > 0,
+    requiresUserMapping: top.profile.requiresUserMapping || confidence < (opts.minAutoConfidence ?? MIN_AUTO_CONFIDENCE) || missing.length > 0,
     userConfirmed: false,
     directionHint: directionHintOf(rows, top.row, fileText),
     candidates,

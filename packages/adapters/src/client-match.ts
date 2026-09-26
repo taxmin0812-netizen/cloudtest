@@ -43,7 +43,22 @@ export interface ClientMatchResult {
 const BIZNO_IN_TEXT = /(?<!\d)(\d{3})[-\s]?(\d{2})[-\s]?(\d{5})(?!\d)/g;
 const MAX_SCAN_ROWS = 5000;
 
-export function detectClientFromFile(input: ClientMatchInput, clients: readonly ClientRef[]): ClientMatchResult {
+/** 수임처 판정 기준 (기본값 — 사무소 설정으로 덮어쓸 수 있다) */
+export interface ClientMatchThresholds {
+  /** 1위 신뢰도가 이 값 미만이면 사람이 고른다 */
+  ambiguousBelow: number;
+  /** 1·2위 차이가 이 값 미만이면 사람이 고른다 */
+  minGap: number;
+}
+
+export const DEFAULT_CLIENT_MATCH_THRESHOLDS: ClientMatchThresholds = { ambiguousBelow: 70, minGap: 10 };
+
+export function detectClientFromFile(
+  input: ClientMatchInput,
+  clients: readonly ClientRef[],
+  thresholds: Partial<ClientMatchThresholds> = {},
+): ClientMatchResult {
+  const th = { ...DEFAULT_CLIENT_MATCH_THRESHOLDS, ...thresholds };
   const byBizNo = new Map<string, ClientRef>();
   for (const c of clients) {
     const b = normalizeBusinessNumber(c.businessNumber);
@@ -118,7 +133,7 @@ export function detectClientFromFile(input: ClientMatchInput, clients: readonly 
 
   const best = candidates[0] ?? null;
   const second = candidates[1];
-  const ambiguous = !best || best.confidence < 70 || (second !== undefined && best.confidence - second.confidence < 10);
+  const ambiguous = !best || best.confidence < th.ambiguousBelow || (second !== undefined && best.confidence - second.confidence < th.minGap);
   return { candidates, best, ambiguous };
 }
 

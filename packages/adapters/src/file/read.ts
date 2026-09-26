@@ -51,6 +51,9 @@ export const DEFAULT_MAX_ROWS = 300_000;
 // ────────────────────────────── 형식 판별 ──────────────────────────────
 
 const OLE_MAGIC = Buffer.from([0xd0, 0xcf, 0x11, 0xe0, 0xa1, 0xb1, 0x1a, 0xe1]);
+/** BIFF8(Excel 97~2003) 'Workbook', BIFF5 'Book' 스트림 이름 (OLE 디렉터리는 UTF-16LE) */
+const OLE_WORKBOOK_STREAM = Buffer.from('Workbook', 'utf16le');
+const OLE_BOOK_STREAM = Buffer.from('Book\u0000', 'utf16le');
 
 export function sniffFileKind(buffer: Buffer): FileKind {
   if (buffer.length === 0) return 'empty';
@@ -127,7 +130,11 @@ export async function readTabularFile(buffer: Buffer, fileName: string, opts: Re
     case 'empty':
       throw new AdapterError('EMPTY_FILE', '빈 파일입니다. 파일을 다시 내려받아 올려주세요.');
     case 'ole':
-      throw new AdapterError('LEGACY_XLS', LEGACY_XLS_MESSAGE, { fileName });
+      // OLE 컨테이너는 .xls 외에 .doc·.hwp 도 있다 — 엑셀 통합문서 스트림(Workbook/Book)이 있거나 확장자가 .xls 일 때만 구형 xls 안내
+      if (ext === 'xls' || buffer.includes(OLE_WORKBOOK_STREAM) || buffer.includes(OLE_BOOK_STREAM)) {
+        throw new AdapterError('LEGACY_XLS', LEGACY_XLS_MESSAGE, { fileName });
+      }
+      throw new AdapterError('UNSUPPORTED_FORMAT', '엑셀 파일이 아닌 문서(한글·워드 등)로 보입니다. 엑셀(.xlsx) 또는 CSV 파일을 올려주세요.', { fileName });
     case 'encrypted_ooxml':
       throw new AdapterError('ENCRYPTED_FILE', '암호가 설정된 엑셀 파일입니다. Excel에서 암호를 해제하고 .xlsx로 저장 후 올려주세요.', { fileName });
     case 'pdf':

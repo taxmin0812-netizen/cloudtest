@@ -75,6 +75,30 @@ describe('suggestRule (수정 이력 → 규칙 제안)', () => {
   });
 });
 
+describe('suggestRule 중복 조건 (검수 보강)', () => {
+  it('같은 사업자번호가 상호키 두 개로 들어오면 규칙 하나로 합친다 (근거 건수 합산)', () => {
+    const r = suggestRulesFromCorrections([
+      corr({ merchantKey: 'SK에너지' }),
+      corr({ merchantKey: 'SK에너지' }),
+      corr({ merchantKey: 'SK에너지' }),
+      corr({ merchantKey: 'SK에너지강남' }),
+      corr({ merchantKey: 'SK에너지강남' }),
+      corr({ merchantKey: 'SK에너지강남' }),
+    ]);
+    expect(r).toHaveLength(1);
+    expect(r[0]).toMatchObject({ condition: { field: 'merchantBusinessNumber', op: 'eq', value: '1208147521' }, accountCode: '822', supportCount: 6 });
+  });
+
+  it('같은 조건에 계정이 엇갈리면 모호하므로 제안하지 않는다 (다른 수임처는 별개)', () => {
+    const r = suggestRulesFromCorrections([
+      ...[1, 2, 3].map(() => corr({ merchantKey: 'A상사', after: '822' })),
+      ...[1, 2, 3].map(() => corr({ merchantKey: 'A상사본점', after: '830', before: '822' })),
+      ...[1, 2, 3].map(() => corr({ clientId: 'c2', merchantKey: 'A상사', after: '822' })),
+    ]);
+    expect(r.map((x) => [x.clientId, x.accountCode])).toEqual([['c2', '822']]);
+  });
+});
+
 describe('explainClassification', () => {
   const classification: AccountClassification = {
     accountCode: '822',

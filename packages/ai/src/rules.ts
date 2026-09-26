@@ -92,7 +92,17 @@ export function suggestRulesFromCorrections(corrections: CorrectionRecord[], opt
       _sort: [top.count, g.merchantKey],
     });
   }
-  return out
-    .sort((a, b) => b._sort[0] - a._sort[0] || (a._sort[1] < b._sort[1] ? -1 : a._sort[1] > b._sort[1] ? 1 : 0))
-    .map(({ _sort: _unused, ...rest }) => rest);
+  out.sort((a, b) => b._sort[0] - a._sort[0] || (a._sort[1] < b._sort[1] ? -1 : a._sort[1] > b._sort[1] ? 1 : 0));
+
+  // 같은 사업자번호가 상호키 여러 개로 들어오면 조건이 같은 제안이 중복된다.
+  // 같은 계정이면 하나로 합치고(근거 건수 합산), 계정이 엇갈리면 모호하므로 제안하지 않는다.
+  const byCondition = new Map<string, { item: (typeof out)[number]; conflict: boolean }>();
+  for (const item of out) {
+    const key = `${item.clientId}|${JSON.stringify(item.condition)}`;
+    const prev = byCondition.get(key);
+    if (!prev) byCondition.set(key, { item: { ...item }, conflict: false });
+    else if (prev.item.accountCode === item.accountCode) prev.item.supportCount = (prev.item.supportCount ?? 0) + (item.supportCount ?? 0);
+    else prev.conflict = true;
+  }
+  return [...byCondition.values()].filter((x) => !x.conflict).map(({ item: { _sort: _unused, ...rest } }) => rest);
 }

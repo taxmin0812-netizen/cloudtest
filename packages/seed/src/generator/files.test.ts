@@ -5,7 +5,6 @@ import {
   HOMETAX_CASH_RECEIPT_HEADERS,
   HOMETAX_INVOICE_EXEMPT_HEADERS,
   HOMETAX_TAX_INVOICE_HEADERS,
-  WEMEMBERS_CARD_VARIANT_HEADERS,
   buildAllFiles,
   buildCardPurchaseFile,
   buildCashReceiptFile,
@@ -24,7 +23,9 @@ const ds = generateDataset();
 describe('헤더 상수 (docs/research/02-wemembers.md §2.5)', () => {
   it('홈택스 사업용카드 14열', () => {
     expect([...HOMETAX_CARD_HEADERS]).toEqual(['승인일자', '카드사', '카드번호', '가맹점사업자번호', '가맹점명', '공급가액', '세액', '비과세', '합계', '가맹점유형', '업태', '업종', '공제여부결정', '비고']);
-    expect(WEMEMBERS_CARD_VARIANT_HEADERS).toHaveLength(15);
+    // 재전송분도 원본과 같은 14열 (승인번호 열을 더하면 원본과 fingerprint 기준이 달라져 완전중복을 못 잡는다)
+    expect(FILE_LAYOUTS.card_purchase_resend.headers).toEqual(HOMETAX_CARD_HEADERS);
+    expect(HOMETAX_CARD_HEADERS).not.toContain('승인번호');
   });
 
   it('전자세금계산서 33열 (공급자/공급받는자 중복 제목), 계산서 24열, 현금영수증 14열', () => {
@@ -99,9 +100,14 @@ describe('파일 생성', () => {
     expect(buildExemptInvoiceFile(ds, 'C017', 'sales')!.dataRowCount).toBeGreaterThan(0);
     expect(buildCashReceiptFile(ds, 'C015')!.rows.slice(2).some((r) => r[11] === '취소거래')).toBe(true);
     const resend = buildResendFile(ds, 'C004')!;
-    expect(resend.header.at(-1)).toBe('승인번호');
+    expect(resend.header).toEqual([...HOMETAX_CARD_HEADERS]);
     expect(resend.dataRowCount).toBe(2);
-    for (const r of resend.rows.slice(2)) expect(String(r[14])).toMatch(/^\d{8}$/);
+    // 재전송 행은 원본 행과 셀 단위로 같다
+    const orig = buildCardPurchaseFile(ds, 'C004')!;
+    for (const [i, id] of resend.rowIds.entries()) {
+      const origId = ds.current.find((t) => t.id === id)!.truth.duplicateOf!;
+      expect(resend.rows[resend.headerRowIndex + 1 + i]).toEqual(orig.rows[orig.headerRowIndex + 1 + orig.rowIds.indexOf(origId)]);
+    }
     expect(buildResendFile(ds, SCENARIO_PAYROLL_CODE)).toBeNull();
   });
 

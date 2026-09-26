@@ -68,11 +68,29 @@ describe('decide', () => {
 
   it('계정 충돌: 대안이 1순위 − 10 이내', () => {
     const alt = (confidence: number) => [{ accountCode: '811', accountName: '복리후생비', confidence, source: 'ai' as const }];
-    expect(decide(null, acc({ confidence: 90, alternatives: alt(80) }), vat(), [], P).buckets).toContain('account_conflict');
-    expect(decide(null, acc({ confidence: 90, alternatives: alt(79) }), vat(), [], P).buckets).not.toContain('account_conflict');
+    expect(decide(null, acc({ source: 'system_rule', confidence: 90, alternatives: alt(80) }), vat(), [], P).buckets).toContain('account_conflict');
+    expect(decide(null, acc({ source: 'system_rule', confidence: 90, alternatives: alt(79) }), vat(), [], P).buckets).not.toContain('account_conflict');
     // 같은 코드 대안은 충돌 아님
-    expect(decide(null, acc({ confidence: 90, alternatives: [{ accountCode: '830', accountName: '소모품비', confidence: 90, source: 'ai' }] }), vat(), [], P).buckets).not.toContain('account_conflict');
-    expect(decide(null, acc({ confidence: 90, alternatives: alt(75) }), vat(), [], P, { conflictMargin: 20 }).buckets).toContain('account_conflict');
+    expect(decide(null, acc({ source: 'system_rule', confidence: 90, alternatives: [{ accountCode: '830', accountName: '소모품비', confidence: 90, source: 'ai' }] }), vat(), [], P).buckets).not.toContain('account_conflict');
+    expect(decide(null, acc({ source: 'system_rule', confidence: 90, alternatives: alt(75) }), vat(), [], P, { conflictMargin: 20 }).buckets).toContain('account_conflict');
+  });
+
+  it('계정 충돌: 수임처 이력 1순위는 사전·AI 후보에 흔들리지 않고, 수임처 이력끼리 근접하면 자동승인 금지', () => {
+    const top = { source: 'exact_history' as const, confidence: 99 };
+    const sys = [{ accountCode: '830', accountName: '소모품비', confidence: 90, source: 'system_rule' as const }];
+    const own = [{ accountCode: '212', accountName: '비품', confidence: 92, source: 'exact_history' as const }];
+    const a1 = decide(null, acc({ ...top, accountCode: '146', accountName: '상품', alternatives: sys }), vat(), [], P);
+    expect(a1.buckets).not.toContain('account_conflict');
+    expect(a1.reviewLevel).toBe('auto');
+    const a2 = decide(null, acc({ ...top, accountCode: '146', accountName: '상품', alternatives: own }), vat(), [], P);
+    expect(a2.buckets).toContain('account_conflict');
+    expect(a2.reviewLevel).not.toBe('auto');
+  });
+
+  it('금액 역산(추정) 거래는 자동승인 금지', () => {
+    const d = decide({ transactionDate: '2026-09-01', rawData: { __derived: ['supply_vat_from_total'] } }, acc(), vat(), [], P);
+    expect(d.reviewLevel).not.toBe('auto');
+    expect(d.buckets).toContain('vat_review');
   });
 
   it('신규 거래처: 이력 없는 분류면 new_merchant, 옵션으로 지정 가능', () => {

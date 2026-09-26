@@ -29,7 +29,7 @@ import {
   taxInvoiceRaw,
   type PartyInfo,
 } from './layouts';
-import { RESERVED_MERCHANT_NAMES, SYNTHETIC_USD_KRW, VAT_ON_SLIP_SIMPLIFIED_NAMES, truthAccountFor } from './merchants';
+import { RESERVED_MERCHANT_NAMES, SYNTHETIC_USD_KRW, VAT_ON_SLIP_SIMPLIFIED_NAMES, acquisitionCostOf, truthAccountFor } from './merchants';
 import { Rng, rngFor } from './prng';
 import { accountNameOf, hometaxDeductibleHint, vatTruthFor } from './truth';
 import type {
@@ -60,6 +60,8 @@ export const CURRENT_MONTH: YearMonth = '2026-09';
 export const SCENARIO_A_BASE_CARD_COUNT = 490;
 /** 2026-09 시나리오상사 카드 건수 (docs/06-mvp-plan.md 시나리오 1) */
 export const SCENARIO1_CARD_COUNT = 500;
+/** 거래처·월별 사업용카드 매입 최소 건수 (스펙: 월 50~600건) — 정기 카드 결제 포함 */
+export const MIN_CARD_PER_MONTH = 50;
 
 // ────────────────────────────── 컨텍스트 ──────────────────────────────
 
@@ -245,6 +247,10 @@ export function buildPurchase(ctx: TxContext, p: PurchaseParams): TxDraft {
   let vat: Won;
   let serviceCharge = p.serviceCharge ?? 0;
   let total: Won;
+  // 금액 누락을 0원으로 조용히 채우지 않는다
+  if (!p.amounts && (evidence === 'tax_invoice' || evidence === 'invoice_exempt' ? p.supply === undefined : p.total === undefined)) {
+    throw new Error(`${client.code} ${m.name}: ${evidence} 금액이 지정되지 않았습니다`);
+  }
   if (p.amounts) {
     ({ supply, vat, serviceCharge, total } = p.amounts);
   } else if (evidence === 'tax_invoice') {
@@ -268,7 +274,8 @@ export function buildPurchase(ctx: TxContext, p: PurchaseParams): TxDraft {
   const cardLike = evidence === 'card' || evidence === 'cash_receipt';
   const hint = cardLike ? (p.hint !== undefined ? p.hint : hometaxDeductibleHint(m, vat)) : null;
   const description = p.description ?? (evidence === 'tax_invoice' || evidence === 'invoice_exempt' ? (m.items[0] ?? '') : '');
-  const accountCode = p.accountCode ?? truthAccountFor(m.kind, client.industry, total);
+  const accountCode =
+    p.accountCode ?? truthAccountFor(m.kind, client.industry, total, acquisitionCostOf({ supplyAmount: supply, totalAmount: total }, client.vatType));
   const merchantTaxType = m.foreign ? 'unknown' : m.taxType;
   const vt = vatTruthFor(
     {
@@ -311,7 +318,6 @@ export function buildPurchase(ctx: TxContext, p: PurchaseParams): TxDraft {
       category: m.foreign ? '' : m.category,
       deductibleLabel: deductibleLabel(hint),
       note: [m.foreign ? '해외' : '', p.cancel ? '취소' : '', description].filter(Boolean).join(' '),
-      approvalNumber: approvalNumber ?? '',
     });
     if (m.foreign) {
       rawData['통화'] = 'USD';
@@ -937,9 +943,12 @@ function generateRegularMonth(ctx: TxContext, client: SyntheticClient, pools: Cl
   const wk = weekendModeOf(spec);
   const base = { client, period: mode.period, channel: mode.channel, status: mode.status, withRaw: mode.current, rng };
 
-  // 사업용카드
+  // 사업용카드 (정기 카드 결제와 합쳐 월 MIN_CARD_PER_MONTH 건 이상)
+  const recurringCards = pools.recurring.filter((r) => r.evidence === 'card').length;
   const nCard =
-    mode.current && client.code === SCENARIO_A_CODE ? SCENARIO_A_BASE_CARD_COUNT : jitterCount(rng, spec.volume.card - pools.recurring.filter((r) => r.evidence === 'card').length);
+    mode.current && client.code === SCENARIO_A_CODE
+      ? SCENARIO_A_BASE_CARD_COUNT
+      : Math.max(MIN_CARD_PER_MONTH - recurringCards, jitterCount(rng, spec.volume.card - recurringCards));
   for (let i = 0; i < nCard; i++) {
     const { merchant } = rng.weighted(pools.card, (e) => e.weight);
     const total = amountFor(rng, merchant, client.industry);

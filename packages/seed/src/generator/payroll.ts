@@ -11,7 +11,7 @@ import type { ExpectedPayrollChange, SyntheticClient, SyntheticEmployee, Synthet
  * 세액은 합성 근사값이다.
  * - 사업소득 3%·지방소득세 10%, 일용근로 (일당−150,000)×6%×(1−55%) 는 법정 산식 (core payroll/withholding 과 같은 끝수 처리)
  * - 근로소득 소득세는 간이세액표가 아닌 합성 근사식 (검증필요 — 실제 세액은 WEHAGO 계산값 사용)
- * - 4대보험 근로자 부담 합계는 과세급여 × 9.4% 근사 (검증필요)
+ * - 4대보험 근로자 부담 합계는 과세급여 × 9.7% 근사 (검증필요)
  *
  * 시나리오 (docs/06-mvp-plan.md §3.2): 시나리오상사 직원 10명, 9월에 김민수 3,300,000 → 3,630,000 (+10%), 최지훈 명단 없음(8/31 퇴사).
  */
@@ -22,8 +22,11 @@ export const PAYROLL_SCENARIO_NAMES = { raised: '김민수', missing: '최지훈
 export const MEAL_ALLOWANCE_NONTAXABLE: Won = 200_000;
 /** 자가운전보조금 비과세 월 한도 20만원 — 검증필요 */
 export const CAR_ALLOWANCE_NONTAXABLE: Won = 200_000;
-/** 4대보험 근로자 부담 근사율 (국민연금 4.75% + 건강 3.595% + 장기요양 + 고용 0.9% ≈ 9.4%) — 검증필요 */
-export const SOCIAL_INSURANCE_APPROX_RATE_PERMILLE = 94;
+/**
+ * 4대보험 근로자 부담 근사율 (2026: 국민연금 4.75% + 건강 3.595% + 장기요양 ≈0.47% + 고용 0.9% ≈ 9.7%).
+ * 연금 기준소득월액 상한은 무시한 근사 — 검증필요 (core withholding 은 연금 4.75% + 기타 4.9% 로 근사).
+ */
+export const SOCIAL_INSURANCE_APPROX_RATE_PERMILLE = 97;
 /** 사업소득 업종코드 합성 기본값 — 실제 코드는 검증필요 */
 export const DEFAULT_BUSINESS_INCOME_CODE = '940909';
 

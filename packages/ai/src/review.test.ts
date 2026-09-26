@@ -329,6 +329,7 @@ describe('5. 부가세 과세기간', () => {
       expect(r[0]).toMatchObject({ code: 'VAT-DEEMED-CANDIDATE', title: '의제매입세액공제 검토', severity: 'warning', metric: { current: 1_500_000 } });
       expect(r[0]!.detail).toContain('면세 농·축·수산물 매입 2건 150만원');
       expect(r[0]!.detail).toContain('8/108');
+      expect(r[0]!.detail).toContain('9/109');
     });
 
     it('간이과세자 → 의제매입 불가 안내', () => {

@@ -29,6 +29,19 @@ export const RESEARCH_CONFIRMED_APIS = {
   hometaxEfiling: false, // 03 A1·U8: 전자신고 제출 API 없음
 } as const;
 
+/**
+ * 이 저장소에 실제로 구현되어 동작하는 구성요소인가 (2026-09-26 점검).
+ * - desktopBridge: apps/bridge 에는 package.json 뿐이고 /api/bridge/* 도 없다 (integration-architecture §7 주의 항목)
+ * - cloudFolderWatcher: worker 에 폴더/버킷 폴링 작업이 없다
+ * 구현 담당이 동작을 확인한 뒤 true 로 바꾼다. 그 전에는 환경변수가 있어도 FILE_BASED 로 표시하지 않는다.
+ */
+export const IMPLEMENTED_COMPONENTS = {
+  desktopBridge: false,
+  cloudFolderWatcher: false,
+} as const;
+
+const BRIDGE_NOT_BUILT = '설계 완료·미구현 — Bridge 앱과 서버 연결(/api/bridge/*)이 아직 없어 동작하지 않습니다. 파일은 웹에서 직접 올려 주세요.';
+
 export const INTEGRATIONS: readonly AdapterIntegrationDescriptor[] = [
   {
     key: 'wemembers.api',
@@ -184,34 +197,34 @@ export const INTEGRATIONS: readonly AdapterIntegrationDescriptor[] = [
     key: 'download_watch',
     group: 'bridge',
     name: '다운로드 폴더 자동 감지 (Desktop Bridge)',
-    status: 'FILE_BASED',
-    statusReason: 'Desktop Bridge 가 PC 다운로드 폴더의 인식 가능한 파일만 올립니다(프로토타입).',
-    capabilities: ['file_watch'],
+    status: 'NOT_AVAILABLE',
+    statusReason: BRIDGE_NOT_BUILT,
+    capabilities: [],
     channel: 'download_watch',
-    docsRef: 'docs/desktop-bridge-design.md',
-    upgradeCondition: 'Bridge 설치·연결',
+    docsRef: 'docs/desktop-bridge-design.md, docs/integration-architecture.md §4.3·§7',
+    upgradeCondition: 'Bridge 프로토타입 + /api/bridge/* 구현 + 서명 검증 테스트 통과 (구현 후 FILE_BASED)',
   },
   {
     key: 'desktop_bridge',
     group: 'bridge',
     name: 'Desktop Bridge',
-    status: 'FILE_BASED',
-    statusReason: '사무소 PC 전용 폴더 ↔ 서버 파일 전달 (프로토타입).',
-    capabilities: ['file_watch', 'file_delivery'],
+    status: 'NOT_AVAILABLE',
+    statusReason: BRIDGE_NOT_BUILT,
+    capabilities: [],
     channel: 'desktop_bridge',
-    docsRef: 'docs/desktop-bridge-design.md',
-    upgradeCondition: 'Tauri 배포',
+    docsRef: 'docs/desktop-bridge-design.md, docs/integration-architecture.md §4.5·§7',
+    upgradeCondition: 'Bridge 프로토타입 + /api/bridge/* 구현 (구현 후 FILE_BASED)',
   },
   {
     key: 'cloud_folder',
     group: 'cloud',
     name: '클라우드/공유 폴더 감시',
     status: 'NOT_AVAILABLE',
-    statusReason: '감시할 폴더(CLOUD_FOLDER_PATH) 또는 버킷 경로(CLOUD_FOLDER_S3_PREFIX)가 설정되지 않았습니다.',
+    statusReason: '폴더 감시 작업(worker)이 아직 구현되지 않았습니다. 파일은 웹에서 직접 올려 주세요.',
     capabilities: [],
     channel: 'cloud_folder',
     docsRef: 'docs/integration-architecture.md §4.4',
-    upgradeCondition: '저장소 설정',
+    upgradeCondition: 'worker 폴링 작업 구현 + 저장소 경로 설정 (CLOUD_FOLDER_PATH 또는 CLOUD_FOLDER_S3_PREFIX) → FILE_BASED',
   },
   {
     key: 'ai_provider.heuristic',
@@ -300,14 +313,26 @@ export function getIntegrationStatuses(env: IntegrationEnv = {}): AdapterIntegra
       case 'wehago.voucher_api':
         if (RESEARCH_CONFIRMED_APIS.wehagoVoucher) set('MOCK', '[MOCK] 공식 API 문서 확보 — 클라이언트 구현 전');
         break;
-      case 'cloud_folder':
-        if (has(env, 'CLOUD_FOLDER_PATH') || has(env, 'CLOUD_FOLDER_S3_PREFIX')) {
-          set('FILE_BASED', `설정된 폴더를 5분 간격으로 확인합니다 (${has(env, 'CLOUD_FOLDER_PATH') ? '로컬/NAS 경로' : 'S3 버킷 경로'}).`, ['folder_watch']);
+      case 'cloud_folder': {
+        const configured = has(env, 'CLOUD_FOLDER_PATH') || has(env, 'CLOUD_FOLDER_S3_PREFIX');
+        if (!IMPLEMENTED_COMPONENTS.cloudFolderWatcher) {
+          if (configured) set('NOT_AVAILABLE', '폴더 경로는 설정되어 있지만 폴더 감시 작업(worker)이 아직 구현되지 않아 파일을 가져가지 않습니다. 웹에서 직접 올려 주세요.');
+        } else if (configured) {
+          set('FILE_BASED', `설정된 폴더를 주기적으로 확인합니다 (${has(env, 'CLOUD_FOLDER_PATH') ? '로컬/NAS 경로' : 'S3 버킷 경로'}).`, ['folder_watch']);
+        } else {
+          set('NOT_AVAILABLE', '감시할 폴더(CLOUD_FOLDER_PATH) 또는 버킷 경로(CLOUD_FOLDER_S3_PREFIX)가 설정되지 않았습니다.');
         }
         break;
+      }
       case 'desktop_bridge':
       case 'download_watch':
-        if (!has(env, 'BRIDGE_SHARED_SECRET')) out.statusReason = `${d.statusReason} (BRIDGE_SHARED_SECRET 미설정 — Bridge 연결 전)`;
+        if (IMPLEMENTED_COMPONENTS.desktopBridge) {
+          if (has(env, 'BRIDGE_SHARED_SECRET')) {
+            set('FILE_BASED', d.key === 'desktop_bridge' ? '사무소 PC 전용 폴더 ↔ 서버 파일 전달 (프로토타입).' : 'Bridge 가 PC 다운로드 폴더의 인식 가능한 파일만 올립니다 (프로토타입).', d.key === 'desktop_bridge' ? ['file_watch', 'file_delivery'] : ['file_watch']);
+          } else {
+            set('NOT_AVAILABLE', 'BRIDGE_SHARED_SECRET 미설정 — Bridge 연결 전입니다.');
+          }
+        }
         break;
       case 'ai_provider.anthropic': {
         const provider = (env.AI_PROVIDER ?? '').trim().toLowerCase();

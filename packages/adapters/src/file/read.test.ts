@@ -43,6 +43,13 @@ describe('readTabularFile — 거부', () => {
     const e = await expectAdapterError(readTabularFile(xls, '카드내역.xls'), 'LEGACY_XLS');
     expect(e.message).toBe(LEGACY_XLS_MESSAGE);
     expect(e.message).toBe('구형 .xls 형식입니다. Excel에서 .xlsx로 저장 후 올려주세요.');
+    // 확장자가 바뀌어도 Workbook 스트림이 있으면 구형 xls
+    const renamed = Buffer.concat([xls, Buffer.from('Workbook', 'utf16le')]);
+    await expectAdapterError(readTabularFile(renamed, '카드내역.dat'), 'LEGACY_XLS');
+    // 한글(.hwp)·워드(.doc) 같은 다른 OLE 문서는 xls 로 안내하지 않는다
+    const hwp = Buffer.concat([xls, Buffer.from('HwpSummaryInformation', 'utf16le')]);
+    const e2 = await expectAdapterError(readTabularFile(hwp, '신고서.hwp'), 'UNSUPPORTED_FORMAT');
+    expect(e2.message).toContain('엑셀 파일이 아닌 문서');
   });
 
   it('빈 파일·PDF·ZIP·바이너리·암호파일', async () => {
@@ -157,6 +164,8 @@ describe('readTabularFile — XLSX', () => {
     expect(str.sheets[0]!.rows.map((r) => r.map((c) => (c instanceof Date ? c.toISOString() : c)))).toEqual(
       mem.sheets[0]!.rows.map((r) => r.map((c) => (c instanceof Date ? c.toISOString() : c))),
     );
+    // 숨김 시트 여부도 스트리밍에서 같게 (숨김 시트가 자동 선택되지 않도록)
+    expect(str.sheets.map((x) => !!x.hidden)).toEqual(mem.sheets.map((x) => !!x.hidden));
   });
 
   it('카드내역 xlsx 왕복', async () => {
@@ -194,3 +203,12 @@ describe('HTML 표 (위장 xls)', () => {
     expect(parseHtmlTables(decodeText(buf).text)[0]!.rows[0]).toEqual(['가맹점명']);
   });
 });
+
+describe('리뷰 보강: HTML 표 견고성', () => {
+  it('잘못된 숫자 엔티티(범위 밖·서로게이트)가 있어도 RangeError 없이 원문을 유지한다', async () => {
+    const html = '<table><tr><td>A&#99999999;B</td><td>&#xD800;</td><td>&#44032;&amp;</td></tr></table>';
+    const f = await readTabularFile(Buffer.from(html, 'utf8'), 'x.xls');
+    expect(f.sheets[0]!.rows[0]).toEqual(['A&#99999999;B', '&#xD800;', '가&']);
+  });
+});
+

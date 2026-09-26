@@ -18,9 +18,6 @@ export const HOMETAX_CARD_HEADERS = [
   '가맹점유형', '업태', '업종', '공제여부결정', '비고',
 ] as const;
 
-/** 위멤버스/Bridge 재전송 변형 (추정): 홈택스 14열 + 승인번호. 검증필요 */
-export const WEMEMBERS_CARD_VARIANT_HEADERS = [...HOMETAX_CARD_HEADERS, '승인번호'] as const;
-
 export const HOMETAX_CASH_RECEIPT_HEADERS = [
   '매입일시', '사용자명', '가맹점사업자번호', '가맹점명', '업종', '공급가액', '부가세', '봉사료', '매입금액',
   '승인번호', '발급수단', '거래구분', '공제여부', '비고',
@@ -83,9 +80,11 @@ export const FILE_LAYOUTS: Readonly<Record<SyntheticFileKind, FileLayout>> = {
     profileId: 'hometax_card_purchase_v1', docsRef: 'docs/research/02-wemembers.md §2.5-(B)', verified: false,
   },
   card_purchase_resend: {
-    kind: 'card_purchase_resend', label: '사업용 신용카드 매입내역 재전송분 (위멤버스/Bridge 변형, 추정)',
-    headers: WEMEMBERS_CARD_VARIANT_HEADERS, keys: WEMEMBERS_CARD_VARIANT_HEADERS, preambleRows: 1,
-    profileId: 'hometax_card_purchase_v1', docsRef: 'docs/research/02-wemembers.md U2 (위멤버스 레이아웃 미확인)', verified: false,
+    // 같은 홈택스 엑셀이 Desktop Bridge 로 다시 들어온 경우. 승인번호 열을 더한 변형을 쓰면 원본(승인번호 없음)과
+    // fingerprint 기준(승인번호 vs 복합키)이 달라져 완전중복이 잡히지 않는다 → 원본과 같은 14열을 쓴다.
+    kind: 'card_purchase_resend', label: '사업용 신용카드 매입내역 재전송분 (Desktop Bridge, 원본과 같은 14열)',
+    headers: HOMETAX_CARD_HEADERS, keys: HOMETAX_CARD_HEADERS, preambleRows: 1,
+    profileId: 'hometax_card_purchase_v1', docsRef: 'docs/research/02-wemembers.md §2.5-(B), 멱등키(승인번호 없음 → 복합키)', verified: false,
   },
   cash_receipt_purchase: {
     kind: 'cash_receipt_purchase', label: '현금영수증 매입내역 (지출증빙)',
@@ -149,11 +148,11 @@ export interface CardRowSource {
   category: string;
   deductibleLabel: string;
   note: string;
-  approvalNumber?: string;
 }
 
-export function cardPurchaseRaw(s: CardRowSource, withApproval = false): Record<string, unknown> {
-  const raw: Record<string, unknown> = {
+/** 홈택스 카드 14열 행. 원본 엑셀에 승인번호 열이 없으므로 승인번호는 rawData 에 넣지 않는다 (02 §멱등키). */
+export function cardPurchaseRaw(s: CardRowSource): Record<string, unknown> {
+  return {
     승인일자: s.date,
     카드사: s.cardCompany,
     카드번호: s.cardMasked,
@@ -169,8 +168,6 @@ export function cardPurchaseRaw(s: CardRowSource, withApproval = false): Record<
     공제여부결정: s.deductibleLabel,
     비고: s.note,
   };
-  if (withApproval) raw['승인번호'] = s.approvalNumber ?? '';
-  return raw;
 }
 
 export interface CashRowSource {
