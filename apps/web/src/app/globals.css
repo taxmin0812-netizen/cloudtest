@@ -1,0 +1,41 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  --bg: 250 250 251;
+  --surface: 255 255 255;
+  --subtle: 244 245 247;
+  --border: 228 230 235;
+  --fg: 17 24 39;
+  --muted: 107 114 128;
+  --primary: 37 84 214;
+  --primary-fg: 255 255 255;
+  --primary-soft: 235 241 253;
+  --navy: 16 30 64;
+  --success: 22 142 84;
+  --success-soft: 231 246 238;
+  --warning: 214 118 20;
+  --warning-soft: 253 243 230;
+  --danger: 205 45 45;
+  --danger-soft: 252 235 235;
+  color-scheme: light;
+}
+
+html, body { height: 100%; }
+body {
+  @apply bg-bg text-fg antialiased;
+  font-size: 14px;
+  font-feature-settings: 'tnum' 1;
+}
+
+/* 숫자는 항상 tabular — 금액 정렬 */
+.num { font-variant-numeric: tabular-nums; text-align: right; }
+
+:focus-visible { outline: 2px solid rgb(var(--primary)); outline-offset: 1px; }
+
+@layer components {
+  .kbd {
+    @apply inline-flex h-[18px] min-w-[18px] items-center justify-center rounded border border-border bg-subtle px-1 font-mono text-2xs text-muted;
+  }
+}
