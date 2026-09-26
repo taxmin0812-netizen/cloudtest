@@ -19,12 +19,11 @@ import { baseNameOf, channelForBridgeFolder, generateBridgeToken, parseBridgeTok
 import { createImport } from './upload';
 import type {
   BridgeResultFileDTO,
-  BridgeResultsDTO,
   BridgeTokenDTO,
   BridgeUploadInput,
   BridgeUploadResult,
   CreateBridgeTokenResult,
-  DownloadFile,
+  ImportDownloadFile,
 } from './types';
 
 export const BRIDGE_CONNECTION_KEY = 'desktop_bridge';
@@ -232,8 +231,8 @@ async function authenticate(db: Database, token: string, bucket: 'request' | 'up
     await db.execute(sql`
       update integration_connections
       set config = jsonb_set(config, '{tokens}', (
-            select coalesce(jsonb_agg(case when t->>'id' = ${entry.id} then jsonb_set(t, '{lastUsedAt}', to_jsonb(${nowIso}::text)) else t end), '[]'::jsonb)
-            from jsonb_array_elements(config->'tokens') t)),
+            select coalesce(jsonb_agg(case when e.t->>'id' = ${entry.id} then jsonb_set(e.t, '{lastUsedAt}', to_jsonb(${nowIso}::text)) else e.t end order by e.ord), '[]'::jsonb)
+            from jsonb_array_elements(config->'tokens') with ordinality as e(t, ord))),
           last_sync_at = now()
       where key = ${BRIDGE_CONNECTION_KEY}
     `);
@@ -299,10 +298,11 @@ function templateFlags(templateVersion: string, validation: Record<string, unkno
 }
 
 /**
- * 받을 WEHAGO 파일 목록 (export_jobs.status = 'ready'). since 이후 생성분만 (없으면 전부). 권한: export.download
+ * 받을 WEHAGO 파일 목록 (export_jobs.status = 'ready'), 생성순. since 이후 생성분만 (없으면 전부) —
+ * 다음 호출의 since 는 마지막 항목의 createdAt 을 쓰면 된다. 권한: export.download
  * Bridge 는 suggestedFileName 으로 WEHAGO 업로드용 폴더에 저장한다 (MOCK_ / _검증필요 표시 유지).
  */
-export async function bridgeResults(db: Database, token: string, since?: string | Date | null): Promise<BridgeResultsDTO> {
+export async function bridgeResults(db: Database, token: string, since?: string | Date | null): Promise<BridgeResultFileDTO[]> {
   const { actor } = await authenticate(db, token, 'request');
   const ctx = createContext(db, actor);
   requirePermission(ctx, 'export.download');
@@ -334,7 +334,7 @@ export async function bridgeResults(db: Database, token: string, since?: string 
     .where(and(...conds))
     .orderBy(asc(exportJobs.createdAt))
     .limit(200);
-  const items: BridgeResultFileDTO[] = rows.map((r) => {
+  return rows.map((r): BridgeResultFileDTO => {
     const f = templateFlags(r.templateVersion, r.validation ?? {});
     const base = stripExtension(r.fileName);
     const ext = /\.[^.]+$/.exec(r.fileName)?.[0] ?? '.xlsx';
@@ -361,14 +361,13 @@ export async function bridgeResults(db: Database, token: string, since?: string 
       downloadHref: `/api/bridge/outbox/${r.id}/file`,
     };
   });
-  return { serverTime: new Date().toISOString(), items };
 }
 
 /**
  * 준비된 WEHAGO 파일 받기 — 사람이 받은 것과 같게 downloaded 로 기록하고 감사로그(export.download)를 남긴다.
  * 권한: export.download
  */
-export async function bridgeDownloadResult(db: Database, token: string, exportJobId: string): Promise<DownloadFile & { sha256: string }> {
+export async function bridgeDownloadResult(db: Database, token: string, exportJobId: string): Promise<ImportDownloadFile & { sha256: string }> {
   const { actor, entry } = await authenticate(db, token, 'request');
   const ctx = createContext(db, actor);
   requirePermission(ctx, 'export.download');

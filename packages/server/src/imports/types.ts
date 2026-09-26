@@ -6,7 +6,7 @@ import type { Direction, EvidenceType, IngestChannel } from '@mintax/core';
 import type { CanonicalField } from '@mintax/adapters';
 import type { ImportState } from './helpers';
 
-export interface ClientCandidateDTO {
+export interface ImportClientCandidateDTO {
   clientId: string;
   name: string;
   /** 000-00-00000 */
@@ -26,7 +26,7 @@ export interface ImportDetectionDTO {
   missingColumns: string[];
   /** 서식이 실제 샘플로 검증되었는가 (현재 모든 프로필 false — 검증필요) */
   profileVerified: boolean;
-  clientCandidates: ClientCandidateDTO[];
+  clientCandidates: ImportClientCandidateDTO[];
   /** 확정된 수임처 (지정 또는 자동 판정) */
   clientId: string | null;
   /** 파일 내용으로 자동 확정했는가 */
@@ -167,7 +167,7 @@ export interface ImportFailuresDTO {
   items: ImportFailureDTO[];
 }
 
-export interface DownloadFile {
+export interface ImportDownloadFile {
   fileName: string;
   data: Buffer;
   mimeType: string;
@@ -237,9 +237,4 @@ export interface BridgeResultFileDTO {
   /** Bridge 가 저장할 권장 파일명 (MOCK_/_검증필요 반영) */
   suggestedFileName: string;
   downloadHref: string;
-}
-
-export interface BridgeResultsDTO {
-  serverTime: string;
-  items: BridgeResultFileDTO[];
 }

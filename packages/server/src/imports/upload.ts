@@ -15,7 +15,7 @@ import { readStoredFile, sha256OfBuffer, storeFile } from '../infra/storage';
 import { enqueueJob } from '../jobs/queue';
 import { DuplicateImportFileError, ImportRejectedError, fromAdapterError, importHref } from './errors';
 import {
-  CHANNEL_LABELS,
+  INGEST_CHANNEL_LABELS,
   MAX_IMPORT_FILE_BYTES,
   NEEDS_CLIENT_TAG,
   deriveImportState,
@@ -138,9 +138,9 @@ export async function createImport(ctx: ServiceContext, input: UploadImportInput
 
   // ── 같은 파일 (멱등성) ──
   if (!input.force) {
-    const prev = await findPreviousImport(ctx.db, sha256, clientId);
+    const prev = await findPreviousImport(ctx.db, sha256, clientId ?? 'any');
     if (prev) {
-      const summary = clientId ? previousImportSummary(prev) : '수임처 확인 대기 중';
+      const summary = prev.clientId ? previousImportSummary(prev) : '수임처 확인 대기 중';
       throw new DuplicateImportFileError(prev.id, kstShort(prev.createdAt), summary);
     }
   }
@@ -244,7 +244,7 @@ export async function createImport(ctx: ServiceContext, input: UploadImportInput
         kind: 'import_failed',
         severity: 'warning',
         title: `수임처 확인 필요 — ${fileName}`,
-        body: `${CHANNEL_LABELS[input.channel]}로 들어온 파일의 수임처를 확정하지 못했습니다. 수임처를 선택하면 바로 가져옵니다.`,
+        body: `${INGEST_CHANNEL_LABELS[input.channel]}로 들어온 파일의 수임처를 확정하지 못했습니다. 수임처를 선택하면 바로 가져옵니다.`,
         href: importHref(importJobId),
         clientId: null,
         dedupeKey: `import_needs_client:${importJobId}`,
@@ -298,6 +298,13 @@ function mimeOf(fileName: string): string | null {
  */
 export async function uploadImportFile(ctx: ServiceContext, input: UploadImportInput): Promise<UploadImportResult> {
   requirePermission(ctx, 'imports.create');
+  if (input?.channel === 'wemembers_api') {
+    // 정직한 연동 상태: 위멤버스 API 는 NOT_AVAILABLE — 업로드 파일을 API 수집으로 표시하지 않는다
+    throw new ImportRejectedError('IMPORT_CHANNEL_NOT_AVAILABLE', '위멤버스 API 연동은 제공되지 않습니다(미확인). 위멤버스에서 내려받은 파일은 "위멤버스 파일"로 올려 주세요.');
+  }
+  if (input?.channel === 'desktop_bridge' || input?.channel === 'download_watch') {
+    throw new ImportRejectedError('IMPORT_CHANNEL_BRIDGE_ONLY', 'Desktop Bridge 경로는 Bridge 프로그램만 사용할 수 있습니다. 웹에서는 "직접 업로드"로 올려 주세요.');
+  }
   return createImport(ctx, input);
 }
 

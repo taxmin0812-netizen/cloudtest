@@ -135,20 +135,22 @@ export async function runClassifyBatchJob(run: JobRunContext): Promise<JobResult
         onProgress: single ? (p, total) => run.progress(p, total) : undefined,
       });
       results.set(key, res);
-      await resolveProblem(ctx, `classify_failed:${t.clientId}:${t.period}`);
+      await resolveProblem(ctx, `classify_failed:${t.clientId}:${t.period}`).catch(() => undefined);
     } catch (e) {
       const ue = toUserError(e);
       failures.set(key, { code: ue.code, message: ue.message });
-      await recordSystemError(ctx, { area: 'classify', error: e, userMessage: ue.message, context: { clientId: t.clientId, period: t.period, jobId: job.id } });
+      // 오류 보고가 실패해도 다른 거래처 처리는 계속한다
+      const known = names.has(t.clientId);
+      await recordSystemError(ctx, { area: 'classify', error: e, userMessage: ue.message, context: { clientId: t.clientId, period: t.period, jobId: job.id } }).catch(() => undefined);
       await notifyProblem(ctx, {
         kind: 'job_failed',
         severity: 'warning',
-        title: `자동분류 실패: ${names.get(t.clientId) ?? '거래처'} ${t.period}`,
+        title: `자동분류 실패: ${names.get(t.clientId) ?? '알 수 없는 거래처'} ${t.period}`,
         body: `${ue.message} 문제를 해결한 뒤 자동분류를 다시 실행하세요.`,
-        href: `/clients/${t.clientId}?period=${t.period}`,
-        clientId: isUuid(t.clientId) ? t.clientId : null,
+        href: known ? `/clients/${t.clientId}?period=${t.period}` : '/jobs',
+        clientId: known ? t.clientId : null,
         dedupeKey: `classify_failed:${t.clientId}:${t.period}`,
-      });
+      }).catch(() => undefined);
     }
     if (!single) await run.progress(i + 1, targets.length);
   }
@@ -325,4 +327,7 @@ export async function startBatchClassification(
 export function registerClassificationJobHandlers(): void {
   registerJobHandler('classify_batch', runClassifyBatchJob);
 }
+
+/** 별칭 (영역 이름 classify) */
+export const registerClassifyJobHandlers = registerClassificationJobHandlers;
 

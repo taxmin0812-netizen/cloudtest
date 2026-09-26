@@ -11,9 +11,9 @@ import { requirePermission, type ServiceContext } from '../context';
 import { writeAudit } from '../infra/audit';
 import { readStoredFile } from '../infra/storage';
 import { fromAdapterError, importHref } from './errors';
-import { CHANNEL_LABELS, WEHAGO_DUPLICATE_REASON, buildImportSummary, deriveImportState, isValidPeriod, stripExtension } from './helpers';
+import { INGEST_CHANNEL_LABELS, WEHAGO_DUPLICATE_REASON, buildImportSummary, deriveImportState, isValidPeriod, stripExtension } from './helpers';
 import { detectionDTO, loadClientRefs } from './shared';
-import type { DownloadFile, ImportDetectionDTO, ImportFailuresDTO, ImportJobDTO, ImportJobDetailDTO, ListImportJobsInput } from './types';
+import type { ImportDownloadFile, ImportDetectionDTO, ImportFailuresDTO, ImportJobDTO, ImportJobDetailDTO, ListImportJobsInput } from './types';
 
 const MAX_FAILURES_LISTED = 5000;
 
@@ -96,7 +96,7 @@ function toDTO(r: BaseRow, job: JobInfo | undefined): ImportJobDTO {
     fileName: r.fileName,
     fileSizeBytes: r.fileSizeBytes,
     channel: r.channel as IngestChannel,
-    channelLabel: CHANNEL_LABELS[r.channel as IngestChannel] ?? r.channel,
+    channelLabel: INGEST_CHANNEL_LABELS[r.channel as IngestChannel] ?? r.channel,
     formatProfile: r.formatProfile,
     formatProfileName: profile?.name ?? null,
     source: r.source,
@@ -231,7 +231,7 @@ export async function getImportFailures(ctx: ServiceContext, importJobId: string
 /**
  * "오류 항목 다운로드" 엑셀. 감사로그 category 'download'. 권한: imports.create
  */
-export async function downloadImportErrorReport(ctx: ServiceContext, importJobId: string): Promise<DownloadFile> {
+export async function downloadImportErrorReport(ctx: ServiceContext, importJobId: string): Promise<ImportDownloadFile> {
   requirePermission(ctx, 'imports.create');
   const row = await loadBase(ctx, importJobId);
   const failures = await loadFailures(ctx, importJobId, 1_000_000);

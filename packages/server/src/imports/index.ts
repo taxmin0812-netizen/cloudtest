@@ -27,7 +27,7 @@ export {
   deriveImportState,
   failureNotificationTitle,
   wehagoDuplicateKey,
-  CHANNEL_LABELS,
+  INGEST_CHANNEL_LABELS,
   CLIENT_AUTO_CONFIDENCE,
   MAX_IMPORT_FILE_BYTES,
   WEHAGO_DUPLICATE_REASON,

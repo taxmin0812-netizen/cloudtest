@@ -256,6 +256,13 @@ function snapshot(r: Pick<RuleRow, 'name' | 'client_id' | 'condition' | 'account
   };
 }
 
+/** updated_at 은 항상 증가 (같은 시각 두 번 수정해도 낙관적 잠금이 동작하도록) */
+function nextUpdatedAt(ctx: ServiceContext, prev: Date | string): Date {
+  const now = ctx.now();
+  const p = new Date(prev).getTime();
+  return now.getTime() > p ? now : new Date(p + 1);
+}
+
 const STATUS_LABEL: Record<MappingRuleStatus, string> = { suggested: '제안', active: '활성', disabled: '비활성', rejected: '거절' };
 
 function scopeLabel(clientName: string | null): string {
@@ -422,7 +429,7 @@ export async function updateMappingRule(ctx: ServiceContext, ruleId: string, pat
     }
   }
   if (changes.length === 0) return toDto(before, ctx.now());
-  const now = ctx.now();
+  const now = nextUpdatedAt(ctx, before.updated_at);
   const res = await ctx.db.execute(sql`
     update mapping_rules set name = ${next.name}, condition = ${JSON.stringify(next.condition)}::jsonb, account_code = ${next.account_code},
       account_name = ${next.account_name}, vat_override = ${next.vat_override ? JSON.stringify(next.vat_override) : null}::jsonb,
@@ -452,7 +459,7 @@ async function transition(
   summaryVerb: string,
   reason?: string | null,
 ): Promise<MappingRuleDto> {
-  const now = ctx.now();
+  const now = nextUpdatedAt(ctx, before.updated_at);
   const approving = to === 'active';
   const res = await ctx.db.execute(sql`
     update mapping_rules set status = ${to}, updated_at = ${now.toISOString()}::timestamptz

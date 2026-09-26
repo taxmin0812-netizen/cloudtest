@@ -20,6 +20,7 @@ export {
 } from './inputs';
 export {
   registerClassificationJobHandlers,
+  registerClassifyJobHandlers,
   resolveBatchTargets,
   runClassifyBatchJob,
   startBatchClassification,

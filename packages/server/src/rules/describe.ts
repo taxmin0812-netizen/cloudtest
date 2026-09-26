@@ -102,7 +102,10 @@ export function validationFailure(message: string, errors: Array<string | FieldE
     const m = e.match(/^([\w.[\]]+):\s*(.*)$/);
     return m ? { field: m[1]!, message: m[2]! } : { field: defaultField, message: e };
   });
-  const detail = fieldErrors.slice(0, 3).map((f) => f.message).join(' / ');
+  const detail = fieldErrors
+    .slice(0, 3)
+    .map((f) => (f.field.startsWith('params.') ? `${f.field.slice(7)}: ${f.message}` : f.message))
+    .join(' / ');
   return new ValidationError(detail ? `${message} (${detail})` : message, fieldErrors);
 }
 

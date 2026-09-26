@@ -10,12 +10,12 @@
     "typecheck": "tsc -p tsconfig.json --noEmit"
   },
   "dependencies": {
-    "@mintax/core": "workspace:*",
-    "@mintax/server": "workspace:*",
-    "@mintax/db": "workspace:*",
     "@mintax/adapters": "workspace:*",
-    "@mintax/security": "workspace:*",
     "@mintax/ai": "workspace:*",
+    "@mintax/core": "workspace:*",
+    "@mintax/db": "workspace:*",
+    "@mintax/security": "workspace:*",
+    "@mintax/server": "workspace:*",
     "@radix-ui/react-dialog": "^1.1.4",
     "@radix-ui/react-dropdown-menu": "^2.1.4",
     "@radix-ui/react-popover": "^1.1.4",
@@ -29,6 +29,7 @@
     "next": "15.5.26",
     "react": "19.1.1",
     "react-dom": "19.1.1",
+    "server-only": "0.0.1",
     "tailwind-merge": "^2.6.0",
     "zod": "^3.25.0"
   },

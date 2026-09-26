@@ -2,7 +2,7 @@
  * classify 영역 통합 테스트용 거래 생성 도우미 (테스트 전용 — 서비스 코드에서 쓰지 않는다).
  */
 import { randomUUID } from 'node:crypto';
-import { transactions, type Database } from '@mintax/db';
+import { getPool, transactions, type Database } from '@mintax/db';
 import { normalizeMerchantName } from '@mintax/core';
 
 export interface TxSeed {
@@ -79,3 +79,20 @@ export const TEST_KEYS = {
   MINTAX_DATA_KEY: Buffer.alloc(32, 7).toString('base64'),
   MINTAX_INDEX_KEY: Buffer.alloc(32, 9).toString('base64'),
 };
+
+/**
+ * 같은 테스트 DB 를 쓰는 통합 테스트 파일끼리 직렬화 (vitest 가 파일을 병렬로 돌려도 DB 초기화가 겹치지 않도록).
+ * beforeAll 에서 잡고 afterAll 에서 closeDb() 전에 푼다.
+ */
+export async function lockTestDatabase(): Promise<() => Promise<void>> {
+  const url = process.env.DATABASE_URL_TEST ?? 'postgres://mintax:mintax_dev@localhost:5432/mintax_test';
+  const client = await getPool(url).connect();
+  await client.query('select pg_advisory_lock(727274001)');
+  return async () => {
+    try {
+      await client.query('select pg_advisory_unlock(727274001)');
+    } finally {
+      client.release();
+    }
+  };
+}

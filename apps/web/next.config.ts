@@ -23,6 +23,8 @@ const securityHeaders = [
 ];
 
 const nextConfig: NextConfig = {
+  // 병렬 개발 서버용 (예: NEXT_DIST_DIR=.next-inbox next dev -p 3101)
+  distDir: process.env.NEXT_DIST_DIR || '.next',
   reactStrictMode: true,
   poweredByHeader: false,
   transpilePackages: ['@mintax/core', '@mintax/server', '@mintax/db', '@mintax/adapters', '@mintax/security', '@mintax/ai'],

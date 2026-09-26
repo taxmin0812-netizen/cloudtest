@@ -26,6 +26,7 @@ import {
   lookupMerchantHistory,
   prepareRiskBatch,
   purchaseVatType,
+  resolveRuleParams,
   resolveRulesForClient,
   type VatOverride,
 } from '@mintax/core/engine/vat-risk-index';
@@ -402,6 +403,13 @@ export async function classifyClientPeriod(ctx: ServiceContext, opts: ClassifyCl
     ruleParams: client.ruleParams,
   });
   const mappingById = new Map(inputs.rules.map((r) => [String(r.id), r]));
+  // 사람이 승인한 규칙이 과거와 다른 계정을 주는 것은 의도된 변경 (승인 전 백테스트로 확인) —
+  // 'changed_from_history' 규칙의 skipManual(기본 true) 파라미터가 켜져 있으면 차단하지 않고 참고(info)로만 남긴다.
+  const changedRuleCodes = new Set(
+    resolveRulesForClient(inputs.reviewRules, clientId)
+      .filter((r) => r.kind === 'changed_from_history' && resolveRuleParams(r, client.ruleParams).skipManual !== false)
+      .map((r) => r.code),
+  );
 
   const computed: Computed[] = new Array(total);
   for (let i = 0; i < total; i++) {
@@ -424,7 +432,15 @@ export async function classifyClientPeriod(ctx: ServiceContext, opts: ClassifyCl
           }
         }
         const vat = classifyVat(tx, acc, { client, rules: inputs.vatRules, override });
-        const risks = evaluateRisks(tx, acc, vat, riskCtx, { inBatch: true });
+        let risks = evaluateRisks(tx, acc, vat, riskCtx, { inBatch: true });
+        if (acc.source === 'user_rule' && changedRuleCodes.size > 0) {
+          const ruleName = acc.evidence.ruleName ?? '사용자 규칙';
+          risks = risks.map((f) =>
+            changedRuleCodes.has(f.ruleCode)
+              ? { ...f, severity: 'info' as const, blocksAutoApproval: false, message: `${f.message} — 승인된 규칙 '${ruleName}'에 따른 변경` }
+              : f,
+          );
+        }
         decision = decide(tx, withDbRuleId(acc, inputs.ruleDbIds), vat, risks, policy, {
           isNewMerchant: !lookupMerchantHistory(historyIndex, tx),
         });

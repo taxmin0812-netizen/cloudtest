@@ -19,14 +19,14 @@ import {
 import { ValidationError } from '@mintax/security';
 import { ImportRejectedError, importHref } from './errors';
 import { CLIENT_AUTO_CONFIDENCE, NEEDS_MAPPING_TAG, buildImportSummary, deriveImportState, formatCount } from './helpers';
-import type { ClientCandidateDTO, ImportDetectionDTO, ImportMappingInput } from './types';
+import type { ImportClientCandidateDTO, ImportDetectionDTO, ImportMappingInput } from './types';
 
 /** 활성 수임처 목록 (수임처 판정용 — 사무소 규모에서 수백 건) */
 export async function loadClientRefs(db: DbOrTx): Promise<Array<ClientRef & { code: string }>> {
   return db.select({ id: clients.id, businessNumber: clients.businessNumber, name: clients.name, code: clients.code }).from(clients).where(eq(clients.active, true));
 }
 
-export function toCandidateDTO(match: ClientMatchResult | null): ClientCandidateDTO[] {
+export function toCandidateDTO(match: ClientMatchResult | null): ImportClientCandidateDTO[] {
   return (match?.candidates ?? []).map((c) => ({
     clientId: c.clientId,
     name: c.name,
@@ -119,12 +119,13 @@ export function detectionFromMapping(preview: ImportPreview, mapping: ImportMapp
 }
 
 /**
- * 같은 파일(sha256)을 같은 수임처에 이미 가져온 기록 (실패·수임처 미정 제외).
+ * 같은 파일(sha256)을 같은 수임처에 이미 가져온 기록 (실패 제외).
+ * clientId: 특정 수임처 / null = 수임처 미정 가져오기 / 'any' = 수임처 무관 (수임처를 모를 때 — 이미 어느 수임처로 가져온 파일이면 그것이 답이다)
  */
 export async function findPreviousImport(
   db: DbOrTx,
   sha256: string,
-  clientId: string | null,
+  clientId: string | null | 'any',
   excludeImportJobId?: string,
 ): Promise<{ id: string; createdAt: Date; status: string; totalRows: number; importedRows: number; duplicateRows: number; failedRows: number; message: string | null; clientId: string | null } | null> {
   const rows = await db
@@ -144,7 +145,7 @@ export async function findPreviousImport(
     .where(
       and(
         eq(files.sha256, sha256),
-        clientId ? eq(importJobs.clientId, clientId) : isNull(importJobs.clientId),
+        clientId === 'any' ? undefined : clientId ? eq(importJobs.clientId, clientId) : isNull(importJobs.clientId),
         inArray(importJobs.status, ['queued', 'running', 'succeeded', 'partial']),
       ),
     )

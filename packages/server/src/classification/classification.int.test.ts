@@ -1,5 +1,5 @@
 import { beforeAll, afterAll, describe, expect, it } from 'vitest';
-import { TEST_KEYS, insertTxs, type TxSeed } from './test-fixtures';
+import { TEST_KEYS, insertTxs, lockTestDatabase, type TxSeed } from './test-fixtures';
 
 process.env.MINTAX_DATA_KEY ??= TEST_KEYS.MINTAX_DATA_KEY;
 process.env.MINTAX_INDEX_KEY ??= TEST_KEYS.MINTAX_INDEX_KEY;
@@ -10,19 +10,26 @@ import { auditLogs, classificationResults, closeDb, mappingRules, setupTestDatab
 import type { AIProvider } from '@mintax/ai';
 import { createTestClient, createTestUser, testContext } from '../testing/factory';
 import { systemActor, type ServiceContext } from '../context';
-import { classifyClientPeriod, loadClassificationInputs } from './index';
+import { classifyClientPeriod, loadClassificationInputs, runClassifyBatchJob, startBatchClassification, type ClassifyBatchJobResult } from './index';
+import { getJob } from '../jobs/queue';
+import { AppError } from '@mintax/security';
+import type { AIClassificationInput, AIClassificationSuggestion, IntegrationDescriptor } from '@mintax/core';
 import { ensureDefaultRules } from '../rules/index';
 
 let db: Database;
 let sys: ServiceContext;
 
+let unlockDb: (() => Promise<void>) | null = null;
+
 beforeAll(async () => {
+  unlockDb = await lockTestDatabase();
   db = await setupTestDatabase();
   await ensureDefaultRules(db);
   sys = testContext(db, systemActor());
 });
 
 afterAll(async () => {
+  await unlockDb?.();
   await closeDb();
 });
 
@@ -138,5 +145,175 @@ describe('classifyClientPeriod — end-to-end on a mini-ledger', () => {
   });
 });
 
-export const _unused: AIProvider | null = null;
-void mappingRules;
+
+class FakeAi implements AIProvider {
+  readonly name = 'fake-llm';
+  readonly model = 'fake-1';
+  inputs: AIClassificationInput[] = [];
+  constructor(private readonly fn: (i: AIClassificationInput) => AIClassificationSuggestion | null | Promise<AIClassificationSuggestion | null>) {}
+  status(): IntegrationDescriptor {
+    return { key: 'ai_provider.fake', name: 'fake', status: 'MOCK', statusReason: 'test', capabilities: [] };
+  }
+  async classifyTransaction(input: AIClassificationInput) {
+    this.inputs.push(input);
+    return this.fn(input);
+  }
+  async reviewLedger() {
+    return [];
+  }
+  async detectAnomaly() {
+    return [];
+  }
+  async explainClassification() {
+    return '';
+  }
+  async suggestRule() {
+    return [];
+  }
+}
+
+describe('classifyClientPeriod — AI stage', () => {
+  it('asks AI only for unknown merchants, once per merchant, without PII, capped, and never auto-approves AI-only', async () => {
+    const cl = await createTestClient(db, { industry: 'service' });
+    await insertTxs(db, hist(cl.id, 3));
+    const ids = await insertTxs(db, [
+      { clientId: cl.id, date: '2026-09-01', merchantName: '미지의공방', merchantBusinessNumber: '2208123456', totalAmount: 44000, description: '공구 구입 연락처 010-1234-5678 주민 900101-1234567' },
+      { clientId: cl.id, date: '2026-09-02', merchantName: '미지의공방', merchantBusinessNumber: '2208123456', totalAmount: 22000, description: '공구' },
+      { clientId: cl.id, date: '2026-09-03', merchantName: '두번째가게', totalAmount: 11000 },
+      { clientId: cl.id, date: '2026-09-04', merchantName: '쿠팡(주)', merchantBusinessNumber: COUPANG_BIZNO, totalAmount: 33000 },
+    ]);
+    const ai = new FakeAi(() => ({ accountCode: '830', accountName: '소모품비', confidence: 99, rationale: '공구·소모품', provider: 'fake-llm', model: 'fake-1' }));
+    const res = await classifyClientPeriod(sys, { clientId: cl.id, period: '2026-09', aiProvider: ai, aiMaxMerchants: 1 });
+    // 미분류 상대방 2곳 중 거래가 많은 1곳만 (상한 1), 같은 상대방 2건은 1회 호출
+    expect(ai.inputs).toHaveLength(1);
+    expect(res.aiCalls).toBe(1);
+    expect(res.aiSkippedMerchants).toBe(1);
+    expect(res.aiUsed).toBe(2);
+    const sent = JSON.stringify(ai.inputs[0]);
+    expect(sent).not.toContain('900101-1234567');
+    expect(sent).not.toContain('010-1234-5678');
+    expect(sent).not.toContain('2208123456');
+    expect(sent).not.toContain('1234-****');
+    const rows = await db.select().from(transactions).where(eq(transactions.clientId, cl.id));
+    const byId = new Map(rows.map((r) => [r.id, r]));
+    for (const id of ids.slice(0, 2)) {
+      const r = byId.get(id)!;
+      expect(r.classificationSource).toBe('ai');
+      expect(r.accountConfidence).toBeLessThanOrEqual(70);
+      expect(r.status).toBe('needs_review');
+    }
+    expect(byId.get(ids[2]!)!.accountCode).toBeNull();
+    expect(byId.get(ids[2]!)!.buckets).toContain('unclassified');
+    expect(byId.get(ids[3]!)!.status).toBe('auto_approved');
+  });
+
+  it('AI failure does not stop the pipeline and is reported honestly', async () => {
+    const cl = await createTestClient(db, { industry: 'service' });
+    await insertTxs(db, [{ clientId: cl.id, date: '2026-09-01', merchantName: '알수없음상사', totalAmount: 5500 }]);
+    const ai = new FakeAi(() => {
+      throw new Error('upstream 503');
+    });
+    const res = await classifyClientPeriod(sys, { clientId: cl.id, period: '2026-09', aiProvider: ai });
+    expect(res).toMatchObject({ total: 1, aiFailed: 1, aiUsed: 0, needsReview: 1, unclassified: 1 });
+  });
+});
+
+describe('classifyClientPeriod — peers, guards, re-run', () => {
+  it('uses the same-industry peer pattern for a merchant new to this client', async () => {
+    const peers = await Promise.all([1, 2, 3].map(() => createTestClient(db, { industry: 'cafe' })));
+    for (const p of peers) {
+      await insertTxs(db, [
+        { clientId: p.id, date: '2026-07-01', merchantName: '서울우유협동조합', merchantBusinessNumber: '1048212345', totalAmount: 120000, status: 'approved', accountCode: '153', accountName: '원재료', evidenceType: 'tax_invoice' },
+        { clientId: p.id, date: '2026-08-01', merchantName: '서울우유협동조합', merchantBusinessNumber: '1048212345', totalAmount: 130000, status: 'exported', accountCode: '153', accountName: '원재료', evidenceType: 'tax_invoice' },
+      ]);
+    }
+    const cl = await createTestClient(db, { industry: 'cafe' });
+    const [id] = await insertTxs(db, [{ clientId: cl.id, date: '2026-09-10', merchantName: '서울우유협동조합', merchantBusinessNumber: '1048212345', totalAmount: 110000, evidenceType: 'tax_invoice' }]);
+    const res = await classifyClientPeriod(sys, { clientId: cl.id, period: '2026-09', aiProvider: null });
+    expect(res.bySource.industry_pattern).toBe(1);
+    const [row] = await db.select().from(transactions).where(eq(transactions.id, id!));
+    expect(row!.accountCode).toBe('153');
+    expect(row!.accountConfidence).toBe(93);
+    expect(row!.status).toBe('needs_review'); // 신규 거래처 + 93 < 95
+    expect(row!.buckets).toContain('new_merchant');
+  });
+
+  it('refuses to reclassify human-confirmed statuses and leaves approved rows alone on needs_review re-runs', async () => {
+    const user = await createTestUser(db, 'staff');
+    const cl = await createTestClient(db);
+    await expect(classifyClientPeriod(sys, { clientId: cl.id, period: '2026-09', onlyStatuses: ['approved'] })).rejects.toBeInstanceOf(AppError);
+    await expect(classifyClientPeriod(sys, { clientId: cl.id, period: '2026/09' })).rejects.toThrow(/형식/);
+    await expect(classifyClientPeriod(sys, { clientId: 'nope', period: '2026-09' })).rejects.toThrow(/찾을 수 없습니다/);
+    const viewer = testContext(db, (await createTestUser(db, 'viewer')).actor);
+    await expect(classifyClientPeriod(viewer, { clientId: cl.id, period: '2026-09' })).rejects.toThrow(/권한/);
+
+    const [a, b] = await insertTxs(db, [
+      { clientId: cl.id, date: '2026-09-01', merchantName: '처음가게', totalAmount: 7700 },
+      { clientId: cl.id, date: '2026-09-02', merchantName: '처음가게', totalAmount: 8800 },
+    ]);
+    await classifyClientPeriod(sys, { clientId: cl.id, period: '2026-09', aiProvider: null });
+    // 사람이 b 를 승인 (다른 영역이 하는 일을 흉내)
+    await db.update(transactions).set({ status: 'approved', accountCode: '811', accountName: '복리후생비', reviewedBy: user.id, classificationSource: 'manual' }).where(eq(transactions.id, b!));
+    const again = await classifyClientPeriod(sys, { clientId: cl.id, period: '2026-09', reclassifyNeedsReview: true, aiProvider: null });
+    expect(again.total).toBe(1);
+    const [ra] = await db.select().from(transactions).where(eq(transactions.id, a!));
+    const [rb] = await db.select().from(transactions).where(eq(transactions.id, b!));
+    expect(rb!.accountCode).toBe('811');
+    expect(rb!.status).toBe('approved');
+    // 사람이 같은 상대방을 811 로 확정 → 이력 1건(name_history)으로 다시 판단
+    expect(ra!.accountCode).toBe('811');
+    expect(ra!.classificationSource).toBe('name_history');
+  });
+});
+
+describe('classify_batch job fan-out', () => {
+  it('processes all clients of the period sequentially and reports per-client outcomes', async () => {
+    // 격리를 위해 2027-01 기간 사용
+    const auto = await createTestClient(db, { name: '가나다자동', industry: 'construction' });
+    const review = await createTestClient(db, { name: '라마바검토', industry: 'construction' });
+    await createTestClient(db, { name: '자료없음' });
+    await insertTxs(db, hist(auto.id, 5, { date: '2026-11-10' }));
+    await insertTxs(db, [
+      { clientId: auto.id, date: '2027-01-05', merchantName: '쿠팡(주)', merchantBusinessNumber: COUPANG_BIZNO, totalAmount: 33000 },
+      { clientId: auto.id, date: '2027-01-06', merchantName: '쿠팡(주)', merchantBusinessNumber: COUPANG_BIZNO, totalAmount: 44000 },
+      { clientId: review.id, date: '2027-01-07', merchantName: '처음보는곳', totalAmount: 12000 },
+    ]);
+    const manager = testContext(db, (await createTestUser(db, 'manager')).actor);
+    const jobId = await startBatchClassification(manager, { period: '2027-01' });
+    const job = (await getJob(db, jobId))!;
+    expect(job.payload).toEqual({ period: '2027-01', all: true });
+    const progress: Array<[number, number]> = [];
+    const out = await runClassifyBatchJob({ ctx: sys, job, progress: async (p, t) => void progress.push([p, t]) });
+    const result = out.result as unknown as ClassifyBatchJobResult;
+    expect(out.status).toBe('succeeded');
+    expect(result.clients).toBe(2);
+    expect(result.autoCompleted).toBe(1);
+    expect(result.needsReview).toBe(1);
+    expect(result.failed).toBe(0);
+    expect(result.summary).toBe('2027년 1월 카드매입 자동처리 전체 거래처 2곳 → 1곳 자동처리 / 1곳 검토필요');
+    expect(result.perClient.map((c) => [c.clientName, c.status])).toEqual([
+      ['가나다자동', 'auto_completed'],
+      ['라마바검토', 'needs_review'],
+    ]);
+    expect(progress.at(-1)).toEqual([2, 2]);
+    const results = await db.select().from(classificationResults).where(eq(classificationResults.batchJobId, jobId));
+    expect(results).toHaveLength(3);
+    const fan = await db.select().from(auditLogs).where(eq(auditLogs.action, 'classification.batch_all'));
+    expect(fan.at(-1)!.summary).toBe(result.summary);
+
+    // 거래 id 로만 온 후속 작업 (가져오기 호환) + 존재하지 않는 거래처는 부분 실패로 보고
+    const [tid] = await insertTxs(db, [{ clientId: review.id, date: '2027-02-01', merchantName: '처음보는곳', totalAmount: 1000 }]);
+    const partial = await runClassifyBatchJob({
+      ctx: sys,
+      job: { ...job, id: jobId, payload: { period: '2027-02', clientIds: [review.id, '00000000-0000-4000-8000-000000000000'] } },
+      progress: async () => undefined,
+    });
+    expect(partial.status).toBe('partial');
+    const pr = partial.result as unknown as ClassifyBatchJobResult;
+    expect(pr.failed).toBe(1);
+    expect(pr.perClient.find((c) => c.status === 'failed')!.error!.message).toMatch(/거래처/);
+    const byTx = await runClassifyBatchJob({ ctx: sys, job: { ...job, payload: { transactionIds: [tid!] } }, progress: async () => undefined });
+    expect((byTx.result as unknown as ClassifyBatchJobResult).periods).toEqual(['2027-02']);
+    await expect(startBatchClassification(manager, { period: '2027-01', clientIds: ['00000000-0000-4000-8000-000000000000'] })).rejects.toThrow(/존재하지 않는 거래처/);
+  });
+});

@@ -15,7 +15,7 @@ import type { NormalizedTransaction, RiskFlag } from '@mintax/core';
 import { importJobs, transactionSources, transactions, type Database } from '@mintax/db';
 import { isAdapterError, normalizeRows, previewImport, type FormatDetection, type NormalizeResult, type RowFailure } from '@mintax/adapters';
 import { AppError } from '@mintax/security';
-import { withTx, type ServiceContext } from '../context';
+import { withTx } from '../context';
 import { writeAudit } from '../infra/audit';
 import { loadClientProfile } from '../infra/clients';
 import { notifyProblem, resolveProblem } from '../infra/notify';
@@ -209,14 +209,6 @@ async function processImport(run: JobRunContext, importJob: ImportJobRow, payloa
     });
   } catch (e) {
     throw toAppError(e);
-  }
-  for (const o of preview.otherDataSheets) {
-    // pipeline.importTabularFile 과 같은 안내 (다른 시트는 이번 적재 대상이 아님)
-    normalized.warnings.push({
-      sourceRowNumber: null,
-      code: 'other_sheet_not_imported',
-      message: `시트 "${o.sheetName}"${o.hidden ? '(숨김)' : ''}에도 거래자료로 보이는 표가 있지만 이번 적재 대상이 아닙니다 — 필요하면 그 시트를 따로 적재하세요.`,
-    });
   }
   await progress(20, 100);
 
@@ -468,6 +460,8 @@ async function processImport(run: JobRunContext, importJob: ImportJobRow, payloa
     } else if (periodCounts.size > 1) {
       notes.push(`여러 달 거래가 섞여 있습니다: ${[...periodCounts.entries()].sort().map(([p, c]) => `${p} ${formatCount(c)}건`).join(', ')} — 거래일자 기준 기간으로 나눠 넣었습니다.`);
     }
+    // 파일 단위 안내(다른 시트에 거래자료가 더 있음, 확장자와 실제 형식 불일치 등) + 행 경고 요약
+    notes.push(...preview.file.warnings);
     notes.push(...summarizeWarnings(normalized.warnings));
 
     const status = counts.failedRows > 0 ? 'partial' : 'succeeded';

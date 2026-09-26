@@ -34,7 +34,7 @@ export const INGEST_CHANNELS: readonly IngestChannel[] = [
   'manual_upload',
 ];
 
-export const CHANNEL_LABELS: Readonly<Record<IngestChannel, string>> = {
+export const INGEST_CHANNEL_LABELS: Readonly<Record<IngestChannel, string>> = {
   wemembers_api: '위멤버스 API',
   wemembers_file: '위멤버스 파일',
   download_watch: '다운로드 폴더 (Bridge)',
