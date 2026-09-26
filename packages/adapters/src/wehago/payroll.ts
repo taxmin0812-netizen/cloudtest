@@ -227,8 +227,10 @@ export async function verifyPayrollExportFile(
   if (parsed.trace) {
     const expSet = new Set(expected.employeeIds);
     const traced = new Set<number>();
+    const idSeen = new Set<string>();
     for (const e of parsed.trace.entries) {
-      if (actual.employeeIds.includes(e.id)) block('duplicate_employee', `같은 인원이 파일에 두 번 있습니다 (${e.id}).`);
+      if (idSeen.has(e.id)) block('duplicate_employee', `같은 인원이 파일에 두 번 있습니다 (${e.id}).`);
+      idSeen.add(e.id);
       actual.employeeIds.push(e.id);
       traced.add(e.firstRow);
       const a = perRow.get(e.firstRow);

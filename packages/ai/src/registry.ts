@@ -68,11 +68,14 @@ export interface ListProviderStatusesOptions {
   current?: AIProvider;
 }
 
+export type ProviderStatusRow = IntegrationDescriptor & {
+  active: boolean;
+  /** 요청(AI_PROVIDER)과 다른 Provider 로 대체된 경우 그 사유 (대체된 행에만) */
+  fallbackReason?: string;
+};
+
 /** 연동 설정 화면용: 모든 Provider 상태 + 현재 사용 여부 (+ 대체 사유) */
-export function listProviderStatuses(
-  env: AIEnv = process.env,
-  opts: ListProviderStatusesOptions = {},
-): Array<IntegrationDescriptor & { active: boolean }> {
+export function listProviderStatuses(env: AIEnv = process.env, opts: ListProviderStatusesOptions = {}): ProviderStatusRow[] {
   const selection = resolveAIProviderSelection(env);
   const live = (name: AIProviderKind) => (opts.current && opts.current.name === name ? opts.current.status() : null);
   const heuristic = live('heuristic') ?? new HeuristicProvider().status();
@@ -82,9 +85,8 @@ export function listProviderStatuses(
       apiKey: envValue(env, 'ANTHROPIC_API_KEY'),
       model: envValue(env, 'AI_MODEL') ?? DEFAULT_AI_MODEL,
     }).status();
-  const heuristicReason = selection.fallbackReason ? `${heuristic.statusReason} · ${selection.fallbackReason}` : heuristic.statusReason;
   return [
-    { ...heuristic, statusReason: heuristicReason, active: selection.active === 'heuristic' },
+    { ...heuristic, active: selection.active === 'heuristic', ...(selection.fallbackReason ? { fallbackReason: selection.fallbackReason } : {}) },
     { ...anthropic, active: selection.active === 'anthropic' },
   ];
 }
