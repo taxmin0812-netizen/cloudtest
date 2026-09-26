@@ -59,16 +59,32 @@ export function createAIProvider(env: AIEnv = process.env, deps: CreateAIProvide
   return heuristic;
 }
 
-/** 연동 설정 화면용: 모든 Provider 상태 + 현재 사용 여부 */
-export function listProviderStatuses(env: AIEnv = process.env): Array<IntegrationDescriptor & { active: boolean }> {
+export interface ListProviderStatusesOptions {
+  /**
+   * 실제 파이프라인이 쓰는 Provider 인스턴스 (createAIProvider 결과).
+   * 주면 그 인스턴스의 상태(인증 실패·모델 없음·일시 중단·최근 호출 결과)를 그대로 보여준다.
+   * 주지 않으면 env 만으로 만든 새 인스턴스의 상태라 런타임 장애가 반영되지 않는다.
+   */
+  current?: AIProvider;
+}
+
+/** 연동 설정 화면용: 모든 Provider 상태 + 현재 사용 여부 (+ 대체 사유) */
+export function listProviderStatuses(
+  env: AIEnv = process.env,
+  opts: ListProviderStatusesOptions = {},
+): Array<IntegrationDescriptor & { active: boolean }> {
   const selection = resolveAIProviderSelection(env);
-  const heuristic = new HeuristicProvider().status();
-  const anthropic = new AnthropicProvider({
-    apiKey: envValue(env, 'ANTHROPIC_API_KEY'),
-    model: envValue(env, 'AI_MODEL') ?? DEFAULT_AI_MODEL,
-  }).status();
+  const live = (name: AIProviderKind) => (opts.current && opts.current.name === name ? opts.current.status() : null);
+  const heuristic = live('heuristic') ?? new HeuristicProvider().status();
+  const anthropic =
+    live('anthropic') ??
+    new AnthropicProvider({
+      apiKey: envValue(env, 'ANTHROPIC_API_KEY'),
+      model: envValue(env, 'AI_MODEL') ?? DEFAULT_AI_MODEL,
+    }).status();
+  const heuristicReason = selection.fallbackReason ? `${heuristic.statusReason} · ${selection.fallbackReason}` : heuristic.statusReason;
   return [
-    { ...heuristic, active: selection.active === 'heuristic' },
+    { ...heuristic, statusReason: heuristicReason, active: selection.active === 'heuristic' },
     { ...anthropic, active: selection.active === 'anthropic' },
   ];
 }

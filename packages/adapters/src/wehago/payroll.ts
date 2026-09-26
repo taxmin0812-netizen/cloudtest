@@ -6,7 +6,7 @@
 import { formatWon, normalizeDate, parseWon, type IncomeType, type PayrollLine, type Won, type YearMonth } from '@mintax/core';
 import { AdapterError } from '../errors';
 import type { CellValue } from '../file/read';
-import { readTemplateWorkbook, writeTemplateWorkbook, type FieldRecord } from './render';
+import { checkTraceIntegrity, readTemplateWorkbook, writeTemplateWorkbook, type FieldRecord, type ParsedTemplateFile } from './render';
 import { templateHeaderHash, validateTemplate, type ExportField, type WehagoTemplate, type WehagoTemplateKind } from './templates';
 
 export interface PayrollExportRow extends PayrollLine {
@@ -66,6 +66,14 @@ export function validatePayrollRows(
   const incomeType = KIND_INCOME[template.kind as keyof typeof KIND_INCOME];
   if (!incomeType) errors.push({ rowIndex: null, employeeId: null, code: 'wrong_template', message: `급여 서식이 아닙니다 (${template.name}).` });
   for (const m of validateTemplate(template)) errors.push({ rowIndex: null, employeeId: null, code: 'template_invalid', message: `서식 오류: ${m}` });
+  if (!template.verified) {
+    warnings.push({
+      rowIndex: null,
+      employeeId: null,
+      code: 'unverified_template',
+      message: template.status === 'mock' ? `임시(MOCK) 서식입니다 (${template.name}) — WEHAGO 실서식 등록 전에는 업로드하지 마세요.` : `검증되지 않은 서식입니다 (${template.name}).`,
+    });
+  }
   if (rows.length === 0) errors.push({ rowIndex: null, employeeId: null, code: 'empty', message: '전송할 인원이 없습니다.' });
   const hasIdColumn = template.columns.some((c) => c.field === 'idNumber');
   const codes = new Set<string>();
@@ -124,8 +132,21 @@ function recordOf(r: PayrollExportRow): FieldRecord {
 export async function writePayrollExport(
   template: WehagoTemplate,
   rows: readonly PayrollExportRow[],
-  meta: { generatedAt?: Date; includeTraceSheet?: boolean } = {},
+  meta: {
+    generatedAt?: Date;
+    includeTraceSheet?: boolean;
+    /** MOCK 서식으로도 파일을 만든다 (미리보기·테스트 전용 — WEHAGO 업로드 금지) */
+    allowMockTemplate?: boolean;
+  } = {},
 ): Promise<Buffer> {
+  // 열 구성이 확인되지 않은 임시 서식으로 만든 파일이 '업로드용'으로 오인되지 않게, 명시적으로 허용할 때만 만든다
+  if (template.status === 'mock' && !meta.allowMockTemplate) {
+    throw new AdapterError(
+      'EXPORT_VALIDATION_FAILED',
+      `임시(MOCK) 서식이라 업로드 파일을 만들지 않습니다 (${template.name}). WEHAGO 에서 내려받은 실제 엑셀서식을 먼저 등록해 주세요.`,
+      { templateKey: template.key, status: template.status },
+    );
+  }
   const v = validatePayrollRows(template, rows);
   if (!v.ok) {
     throw new AdapterError('EXPORT_VALIDATION_FAILED', `급여 파일을 만들 수 없습니다 — 오류 ${v.errors.length}건: ${v.errors.slice(0, 3).map((e) => e.message).join(' / ')}`, {
@@ -164,16 +185,30 @@ export async function verifyPayrollExportFile(
   const diffs: PayrollVerifyResult['diffs'] = [];
   const block = (code: string, message: string) => diffs.push({ code, message, blocking: true });
   const actual: PayrollExportTotals & { employeeIds: string[] } = { count: 0, grossPay: 0, incomeTax: 0, localIncomeTax: 0, netPay: 0, employeeIds: [] };
-  const parsed = await readTemplateWorkbook(buffer, template);
+  let parsed: ParsedTemplateFile;
+  try {
+    parsed = await readTemplateWorkbook(buffer, template);
+  } catch (e) {
+    block('sheet_missing', `파일을 읽을 수 없습니다: ${e instanceof Error ? e.message : String(e)}`);
+    return {
+      ok: false,
+      actual,
+      expected: { ...expected, employeeIds: [...expected.employeeIds] },
+      diffs,
+      summary: `전송 금지: ${diffs[0]!.message}`,
+    };
+  }
   if (!parsed.sheetName) block('sheet_missing', `데이터 시트(${template.sheetName})가 없습니다.`);
   for (const m of parsed.headerMismatches) block('header_mismatch', `제목행이 서식과 다릅니다: ${m}`);
   if (parsed.trace && parsed.trace.headerHash !== templateHeaderHash(template)) block('template_changed', '파일 생성 당시 서식과 현재 서식이 다릅니다.');
+  for (const issue of checkTraceIntegrity(parsed, template)) block(issue.code, issue.message);
 
+  // 숫자 셀만 금액으로 인정 (텍스트 금액은 WEHAGO 가 다르게 읽을 수 있음)
   const num = (v: CellValue | undefined, label: string, row: number): number => {
     if (v === null || v === undefined || v === '') return 0;
-    const n = typeof v === 'number' || typeof v === 'string' ? parseWon(v) : null;
+    const n = typeof v === 'number' ? parseWon(v) : null;
     if (n === null) {
-      block('unreadable_amount', `${row}행 ${label} 금액을 읽을 수 없습니다.`);
+      block('unreadable_amount', `${row}행 ${label} 금액을 읽을 수 없습니다${typeof v === 'string' ? ' (숫자가 아닌 텍스트 셀)' : ''}.`);
       return 0;
     }
     return n;
@@ -191,14 +226,18 @@ export async function verifyPayrollExportFile(
   }
   if (parsed.trace) {
     const expSet = new Set(expected.employeeIds);
+    const traced = new Set<number>();
     for (const e of parsed.trace.entries) {
+      if (actual.employeeIds.includes(e.id)) block('duplicate_employee', `같은 인원이 파일에 두 번 있습니다 (${e.id}).`);
       actual.employeeIds.push(e.id);
+      traced.add(e.firstRow);
       const a = perRow.get(e.firstRow);
       if (!a || a.some((x, k) => x !== e.amounts[k])) block('row_amount_mismatch', `${e.firstRow}행: 생성 당시 금액과 다릅니다.`);
       if (!expSet.has(e.id)) block('extra_employee', `대상이 아닌 인원이 파일에 있습니다 (${e.id}).`);
     }
     const seen = new Set(actual.employeeIds);
     for (const id of expected.employeeIds) if (!seen.has(id)) block('missing_employee', `인원 ${id} 가 파일에 없습니다.`);
+    for (const { excelRow } of parsed.dataRows) if (!traced.has(excelRow)) block('untraced_row', `${excelRow}행은 생성 당시 없던 행입니다 (추가·이동된 행).`);
   } else {
     diffs.push({ code: 'no_trace', message: '추적 시트가 없어 인원은 건수로만 확인했습니다.', blocking: false });
   }
