@@ -1,0 +1,31 @@
+{
+  "name": "min-tax-ops",
+  "private": true,
+  "version": "0.1.0",
+  "description": "MIN TAX OPS — 세무회계 사무실 업무자동화 미들웨어 (위멤버스 ↔ WEHAGO)",
+  "packageManager": "pnpm@10.33.0",
+  "engines": { "node": ">=22" },
+  "scripts": {
+    "dev": "concurrently -n web,worker -c blue,green \"pnpm --filter @mintax/web dev\" \"pnpm --filter @mintax/worker dev\"",
+    "build": "pnpm --filter @mintax/web build",
+    "start": "concurrently -n web,worker \"pnpm --filter @mintax/web start\" \"pnpm --filter @mintax/worker start\"",
+    "typecheck": "pnpm -r --parallel typecheck",
+    "test": "vitest run",
+    "test:unit": "vitest run --project unit",
+    "test:integration": "vitest run --project integration",
+    "test:golden": "vitest run --project unit packages/seed",
+    "test:e2e": "playwright test",
+    "db:generate": "pnpm --filter @mintax/db generate",
+    "db:migrate": "pnpm --filter @mintax/db migrate",
+    "db:seed": "pnpm --filter @mintax/seed seed",
+    "db:reset": "pnpm --filter @mintax/db reset && pnpm db:migrate && pnpm db:seed"
+  },
+  "devDependencies": {
+    "@playwright/test": "1.56.1",
+    "@types/node": "^22.10.0",
+    "concurrently": "^9.1.0",
+    "tsx": "^4.19.0",
+    "typescript": "5.9.3",
+    "vitest": "^3.2.4"
+  }
+}
