@@ -196,6 +196,10 @@ export function assertSecurityConfig(env: Env = process.env, opts: LoadKeyOption
   if (env.MINTAX_DATA_KEY?.trim() && env.MINTAX_DATA_KEY.trim() === env.MINTAX_INDEX_KEY?.trim()) {
     warnings.push('MINTAX_INDEX_KEY 와 MINTAX_DATA_KEY 가 같습니다 — 서로 다른 키를 사용하세요');
   }
+  // .env.example 기본값(COOKIE_SECURE=false)을 운영에 그대로 복사한 경우. 사내 LAN(http) 운영을 막지 않도록 경고만 한다.
+  if (isProduction(env) && env.COOKIE_SECURE?.trim().toLowerCase() === 'false') {
+    warnings.push('운영 환경인데 COOKIE_SECURE=false 입니다 — HTTPS 로 접속하게 하고 COOKIE_SECURE=true 로 바꾸세요 (세션 쿠키가 암호화되지 않은 연결로 전송될 수 있음)');
+  }
   return { warnings };
 }
 
@@ -371,14 +375,43 @@ export function normalizeForBlindIndex(value: string, purpose: BlindIndexPurpose
   return s;
 }
 
+/** 마스킹 문자 (*, ＊, ●, •, ○, ■, □) — 마스킹된 번호로 해시를 만들면 서로 다른 사람이 같은 값이 된다 */
+const MASK_CHAR_RE = /[*＊●•○■□]/;
+/** 숫자 자릿수가 고정된 용도 */
+const EXACT_DIGITS: Readonly<Record<string, { digits: number; label: string }>> = {
+  rrn: { digits: 13, label: '주민(외국인)등록번호는 13자리' },
+  business_number: { digits: 10, label: '사업자등록번호는 10자리' },
+};
+const MIN_DIGITS = 6;
+
 /**
  * 검색·중복확인용 HMAC-SHA256 (hex 64자). 복호화할 수 없다.
  * 용도(purpose)가 다르면 같은 값이라도 다른 해시가 나온다.
+ *
+ * 숫자형 용도(rrn·bank_account·business_number·phone)는 마스킹 값('900101-1******')이나 자릿수가 틀린 값을 거부한다.
+ * 숫자만 남기면 '9001011' 처럼 짧아져 생년월일·성별이 같은 다른 직원과 해시가 겹치고,
+ * employees.id_number_hash 로 동일인 판정할 때 서로 다른 직원의 급여가 합쳐질 수 있기 때문이다.
  */
 export function blindIndex(value: string, purpose: BlindIndexPurpose, key: Buffer = getIndexKey()): string {
   if (!PURPOSE_RE.test(purpose)) throw new CryptoError('CRYPTO_INVALID_INPUT', `blind index 용도 '${String(purpose).slice(0, 40)}' 가 올바르지 않습니다.`);
   const normalized = normalizeForBlindIndex(value, purpose);
   if (normalized === '') throw new ValidationError('검색할 값이 비어 있습니다.', [], `blindIndex(${purpose}): 정규화 후 빈 값`);
+  if (DIGITS_ONLY.has(purpose)) {
+    if (MASK_CHAR_RE.test(String(value))) {
+      throw new ValidationError(
+        '마스킹된 번호로는 조회·중복확인을 할 수 없습니다. 원본 번호 전체를 입력해 주세요.',
+        [],
+        `blindIndex(${purpose}): 마스킹 문자 포함`,
+      );
+    }
+    const exact = EXACT_DIGITS[purpose];
+    if (exact && normalized.length !== exact.digits) {
+      throw new ValidationError(`${exact.label}여야 합니다. 번호를 확인해 주세요.`, [], `blindIndex(${purpose}): 자릿수 ${normalized.length}`);
+    }
+    if (!exact && normalized.length < MIN_DIGITS) {
+      throw new ValidationError('번호가 너무 짧습니다. 번호 전체를 입력해 주세요.', [], `blindIndex(${purpose}): 자릿수 ${normalized.length}`);
+    }
+  }
   return createHmac('sha256', key).update(purpose).update('\u0000').update(normalized, 'utf8').digest('hex');
 }
 

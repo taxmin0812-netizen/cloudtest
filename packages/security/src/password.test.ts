@@ -55,6 +55,14 @@ describe('hashPassword / verifyPassword', () => {
     expect(await verifyPassword('Abcdefghij1', evil)).toBe(false);
   });
 
+  it('N·r 이 각각 허용 범위여도 합산 메모리(128·N·r)가 256MiB 를 넘으면 거부', async () => {
+    const h = await hashPassword('Abcdefghij1', FAST);
+    const heavy = h.replace('$1024$8$', `$${2 ** 18}$32$`); // 1GiB
+    expect(isPasswordHash(heavy)).toBe(false);
+    expect(await verifyPassword('Abcdefghij1', heavy)).toBe(false);
+    expect(isPasswordHash(h.replace('$1024$8$', `$${2 ** 18}$8$`))).toBe(true); // 정확히 256MiB 는 허용
+  });
+
   it('해시 변조 시 false', async () => {
     const h = await hashPassword('Abcdefghij1', FAST);
     const parts = h.split('$');
@@ -119,6 +127,17 @@ describe('validatePasswordPolicy', () => {
     expect(validatePasswordPolicy('Tax-Office-2026', { email: 'minjun@office.co.kr' }).ok).toBe(true);
     // 2자 이하 아이디는 검사하지 않음 (오탐 방지)
     expect(validatePasswordPolicy('Tax-Office-2026', { email: 'ta@office.co.kr' }).ok).toBe(true);
+  });
+
+  it('전각 문자는 NFKC 정규화한 값으로 판단 (해시와 같은 기준)', () => {
+    // 원문 기준이면 전각 'Ｆ' 가 특수문자로 세져 3종류지만, 정규화하면 대문자+숫자 2종류뿐이므로 거부
+    expect(validatePasswordPolicy('ABCDEＦ12345').ok).toBe(false);
+    // 전각 '！' 는 정규화 후에도 특수문자
+    expect(validatePasswordPolicy('Abcdefghi！1').ok).toBe(true);
+    // 전각으로 쓴 이메일 아이디도 탐지
+    expect(validatePasswordPolicy('ｋｉｍｔａｘ-2026!A', { email: 'kimtax@office.kr' }).errors).toContain(
+      '비밀번호에 이메일 아이디를 포함할 수 없습니다.',
+    );
   });
 
   it('여러 위반은 모두 보고', () => {

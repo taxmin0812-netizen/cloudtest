@@ -1,5 +1,6 @@
 import type { Database, DbOrTx } from '@mintax/db';
 import type { Permission, Role } from '@mintax/core';
+import { ForbiddenError, PERMISSION_LABELS } from '@mintax/security';
 
 /** 요청 주체. 시스템 작업(worker)은 kind: 'system' */
 export interface Actor {
@@ -37,4 +38,17 @@ export function createContext(db: Database, actor: Actor, now: () => Date = () =
 /** 트랜잭션 안에서 ctx.db 를 tx 로 바꿔 끼운 컨텍스트 */
 export function withTx(ctx: ServiceContext, tx: DbOrTx): ServiceContext {
   return { ...ctx, db: tx as unknown as Database };
+}
+
+/**
+ * 권한 검사 — 사용자 대상 서비스 함수는 첫 줄에서 반드시 호출한다 (최소권한).
+ * 실패 시 ForbiddenError (한국어 메시지, 403).
+ */
+export function requirePermission(ctx: ServiceContext, permission: Permission): void {
+  if (ctx.actor.permissions.has(permission)) return;
+  throw new ForbiddenError(permission, PERMISSION_LABELS[permission]);
+}
+
+export function hasPermission(ctx: ServiceContext, permission: Permission): boolean {
+  return ctx.actor.permissions.has(permission);
 }

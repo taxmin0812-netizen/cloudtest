@@ -10,6 +10,6 @@
     "typecheck": "tsc -p tsconfig.json",
     "start": "tsx src/main.ts"
   },
-  "dependencies": {"@mintax/core": "workspace:*"},
+  "dependencies": {"@mintax/core": "workspace:*", "@mintax/adapters": "workspace:*"},
   "devDependencies": {}
 }

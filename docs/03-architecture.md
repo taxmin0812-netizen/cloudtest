@@ -67,7 +67,8 @@ flowchart LR
   WM -- "신고리스트 일괄 ZIP<br/>(접수증·납부서)" --> BR
 ```
 
-- 실선은 모두 오늘 확인된 경로다. 자동 API 경로는 없다. 근거는 [integration-architecture](./integration-architecture.md) §7에 있다.
+- 외부 시스템 사이의 선은 모두 오늘 확인된 **파일 경로**다. 자동 API 경로는 없다. 근거는 [integration-architecture](./integration-architecture.md) §7에 있다.
+- Desktop Bridge(`BR`)를 거치는 선은 **설계 목표**다. 2026-09-26 현재 `apps/bridge`와 `/api/bridge/*`는 구현되지 않았다. 그때까지는 직원이 브라우저로 올리고 받는다.
 - **역할 분리 원칙**: WEHAGO T도 홈택스에서 세금계산서·카드·현금영수증을 직접 수집한다(research/01 §2.9). 같은 자료를 MIN TAX OPS가 전표 파일로 다시 넣으면 이중 기장이 된다. 그래서 MIN TAX OPS가 전송 대상을 정하는 기준은 **수임처별 설정**이다. 이 설정은 온보딩 체크리스트에서 확정한다. WEHAGO가 이미 수집하는 원천은 "분류·검토·대사만" 하고 파일로 내보내지 않는다.
 
 ### 2.2 월간 업무 루프
@@ -99,7 +100,7 @@ flowchart LR
 | 검토완료 | `reviewed` | `needs_review` 0건 |
 | 전송준비 | `export_ready` | 최신 `reconciliation_jobs(phase=pre_export).export_allowed = true` 이고 `export_jobs.status = ready` |
 | 전송 | `exported` | `export_jobs.status in (downloaded, uploaded_confirmed)` |
-| 대사완료 | `reconciled` | `reconciliation_jobs(phase=post_export).balanced = true` |
+| 대사완료 | `reconciled` | 최신 `reconciliation_jobs(phase=post_export)`의 `export_allowed = true`(= 균형 ∧ blocking 차이 0). `balanced`만 보면 안 된다: `balanced`는 원본 등식만 보고 WEHAGO 누락(`missing_in_wehago`)·금액 불일치는 반영하지 않는다 |
 
 ---
 
@@ -240,10 +241,14 @@ stateDiagram-v2
   auto_approved --> exported : WEHAGO 파일 포함
   approved --> exported : WEHAGO 파일 포함
   exported --> reconciled : WEHAGO 역수입 대사 일치
-  exported --> needs_review : 역수입 불일치 → 재검토
 ```
 
-- `failed`는 정규화 단계에서 거래를 만들 수 없는 행이다. 이런 행은 `transaction_sources.outcome = 'failed'`로만 남고 `transactions`에는 없다. 사람이 원본을 고쳐 재업로드하거나 "제외 확인"을 해야 대사 등식에서 설명된다.
+- **전송 후 변경 규칙 (이중 기장 방지)**: 거래가 전송파일에 들어간 뒤에는 MIN TAX OPS 쪽 상태만 되돌리지 않는다. WEHAGO에 이미 전표가 있을 수 있기 때문이다.
+  - 포함된 `export_jobs`가 `ready`(아직 아무도 받지 않음)이면: 승인·수정·제외·되돌리기를 허용한다. 그 파일은 즉시 `blocked`(사유 "포함 거래가 변경되었습니다. 파일을 다시 만드세요")로 바꾼다.
+  - `downloaded` 또는 `uploaded_confirmed`이면: 단건 처리와 `Ctrl+Z`·감사로그 되돌리기를 **막는다**. 정정은 §8.3 "정정 전송"으로만 한다. 이 절차에는 사람이 WEHAGO에서 이전 전표를 지웠다는 확인이 들어간다.
+  - 역수입 대사가 불일치해도 거래를 `needs_review`로 되돌리지 않는다. 불일치는 대사 보고서의 차이(`missing_in_wehago`·`amount_mismatch` 등)로만 남긴다. 해결은 WEHAGO 수정 후 재대사하거나 §8.3 정정 전송으로 한다.
+
+- `failed`는 정규화 단계에서 거래를 만들 수 없는 행이다. 이런 행은 `transaction_sources.outcome = 'failed'`로만 남고 `transactions`에는 없다. 사람이 원본을 고쳐 재업로드하거나 "제외 확인"을 해야 대사에서 풀려야 한다. 그러나 이 해소를 기록할 컬럼이 아직 없다(§14 G6). 그때까지 실패 행이 있는 기간은 전송할 수 없다.
   - `TransactionStatus`의 `failed`는 거래 생성 후 후처리에서 실패한 경우(예: 필수 매핑 누락)를 위해 남겨 둔다.
 - **재분류는 사람 확정을 덮어쓰지 않는다.** `classify_batch`는 `imported / classified / needs_review` 상태만 갱신한다. `approved / auto_approved / exported`는 새 `classification_results`를 참고용으로만 추가한다. 예외가 하나 있다. 새로 승인된 규칙을 "기존 자동확정분에도 적용"할 때는 사람이 미리보기를 보고 승인해야 한다.
 
@@ -253,20 +258,29 @@ stateDiagram-v2
 
 ### 5.1 단계 (Level) — 먼저 결정한 단계가 이긴다
 
-| # | `ClassificationSource` | 조회 키 / 데이터 | 채택 조건 (기본값, `settings`로 조정) | 신뢰도 (기본) | `evidence` |
+아래 기본값은 **`packages/core/src/engine/classify.ts`의 `CLASSIFY_PARAMS`가 기준**이다(2026-09-26 코드와 대조함). 값을 바꾸면 이 표도 같이 고친다.
+
+| # | `ClassificationSource` | 조회 키 / 데이터 | 채택 조건 | 신뢰도 (기본) | `evidence` |
 |---|---|---|---|---|---|
-| 1 | `user_rule` | `mapping_rules` where `status='active'` and `client_id = 수임처` (origin `user` 또는 승인된 `system_suggested`) | DSL 조건 일치. `priority` 내림차순으로 첫 일치 | `rule.confidence` (기본 99) | `ruleId, ruleName` |
-| 2 | `exact_history` | 확정 거래 `client_id + merchant_business_number` (`tx_client_merchant_bizno_idx`) | 이력 ≥ 3건 & 동일 계정 비율 ≥ 90% | 10건 이상 & 100% → 99, 그 외 95~98 구간 | `historyCount, consistentCount, lastUsedDate, averageAmount` |
-| 3 | `name_history` | 확정 거래 `client_id + merchant_key` (`tx_client_merchant_key_idx`) | L2 미결일 때. 이력 ≥ 3건 & 일관성 ≥ 90% | 최대 97 | 위와 같음 |
-| 4 | `correction_memory` | `classification_corrections` `client_id + merchant_key + field='account'` 최근 180일 | L2·L3 미결 또는 이력보다 수정이 최신일 때 | 수정 1회 90, 2회 93, 3회 이상 94 (**자동확정 불가 구간**). 같은 수정이 3회 쌓이면 규칙 제안 | `correctionCount` |
-| 5 | `industry_pattern` | 같은 업종 다른 수임처의 확정 거래 `merchant_key` (`tx_merchant_key_global_idx`) | 참조 수임처 ≥ 3곳 & 일관성 ≥ 90% | 최대 93 | `peerClientCount, historyCount` |
-| 6 | `system_rule` | `mapping_rules` where `origin='system_default'` and `client_id is null` (예: KT → 통신비) | DSL 조건 일치 | `rule.confidence` (기본 90) | `ruleId, ruleName` |
-| 7 | `ai` | `packages/ai` Provider (기본 휴리스틱) | 후보 계정 목록 안에서만 추천 | 유사 이력이 있으면 **상한 85**, AI 추론만 있으면 70 | `aiProvider, aiModel` |
+| 1 | `user_rule` | `mapping_rules` where `status='active'` and `client_id = 수임처` (origin `user` 또는 승인된 `system_suggested`) | DSL 조건 일치. `priority` 내림차순으로 첫 일치. 밀린 규칙은 −15점 대안 | `rule.confidence` (기본 99) | `ruleId, ruleName` |
+| 2 | `exact_history` | 확정 거래 `client_id + merchant_business_number` (`tx_client_merchant_bizno_idx`) | 이력 1건 이상. 계정이 갈리면 가중 일관성(사람 수정 이력 ×3, 반감기 365일)으로 감점 | 일관 처리 건수 사다리: 1건 92 · **2건 95** · 3건 97 · 5건 98 · 10건 99. 계정이 갈리면 상한 98 − round((1−일관성)×30), 일관성 < 60%이면 79 | `historyCount, consistentCount, lastUsedDate, averageAmount` |
+| 3 | `name_history` | 확정 거래 `client_id + merchant_key` (`tx_client_merchant_key_idx`) | 사업자번호 이력이 없을 때 | 1건 90 · 2건 94 · 3건 이상 97 (감점 규칙은 L2와 같음) | 위와 같음 |
+| 4 | `correction_memory` | `classification_corrections` `client_id + merchant_key + field='account'` 최근 180일 | 이력이 없을 때, 또는 이력과 같은 계정이면서 신뢰도가 더 높을 때. 이력과 계정이 다르면 이력(수정 우선 원칙 적용 후)이 이긴다 | 수정 1회 90, 2회 93, 3회 이상 94 (**자동확정 불가 구간**). 같은 수정이 3회 쌓이면 규칙 제안 | `correctionCount` |
+| 5 | `industry_pattern` (강) | 같은 업종 다른 수임처의 확정 거래 `merchant_key` (`tx_merchant_key_global_idx`) | 참조 수임처 ≥ 3곳 & 일치율 ≥ 80% | 93 | `peerClientCount, historyCount` |
+| 6 | `system_rule` | `mapping_rules` where `origin='system_default'` and `client_id is null` (예: KT → 통신비) | DSL 조건 일치 | `rule.confidence`, **상한 90** | `ruleId, ruleName` |
+| 6′ | `industry_pattern` (약·타업종) | L5와 같음 | L5 조건 미달이거나 타업종 패턴 | 3곳 이상·일치율 미달 88에서 감점, 2곳 85, 1곳 75, 타업종 상한 85 | 위와 같음 |
+| 7 | `ai` | `packages/ai` Provider (기본 휴리스틱). `mergeAiSuggestion`으로 합친다 | 앞 단계 결과가 없거나 신뢰도 < `quickReviewMin`(80)일 때만 1순위가 될 수 있다. 그 밖에는 충돌을 만들지 않는 참고 대안이다. 계정표에 없거나 비활성인 코드는 버린다 | 유사 이력이 있으면 **상한 85**, AI 추론만 있으면 70 | `aiProvider, aiModel` |
 | 8 | `none` | — | 모든 단계 미결 | 0 → `unclassified` 버킷 | — |
 
-- 신뢰도 구간 문구는 `CONFIDENCE_LADDER`(99/97/93/85/70)와 같게 유지한다. 설명 패널이 이 문구를 쓴다.
+- 공통 보정
+  - 금액이 이력 평균의 3배를 넘으면 −5점이다(이력 2건 이상일 때).
+  - 계정표에 없거나 비활성인 계정은 상한 79다(반드시 검토).
+- **정책 검토 항목 (오너 확인)**: 같은 사업자번호로 **2번** 일관되게 확정된 이력이 있으면 95점이 되어 자동확정된다. 더 보수적으로 하려면 `exactHistoryLadder`의 2건 값을 94 이하로 낮춘다. 이 표만 고쳐서는 바뀌지 않고, core 설정을 바꿔야 한다.
+- `CONFIDENCE_LADDER`(99/97/93/85/70)의 설명 문구는 위 사다리의 대표 구간이다. 설명 패널이 이 문구를 쓴다.
 - **수정 우선 원칙**: L2·L3에서 같은 거래처의 가장 최근 사람 수정이 과반 이력과 다르면, 일관성은 **그 수정일 이후 이력만**으로 다시 계산한다. 옛 이력이 새 수정을 이겨서 같은 실수를 반복하는 일을 막는다.
 - **대안 후보(`alternatives`)**: 이긴 단계 외의 단계도 모두 평가해서 후보를 모은다. 다른 계정 후보의 신뢰도가 (1순위 − 10) 이상이면 `account_conflict` 버킷을 붙인다.
+  - 예외 1: `user_rule`이 이기면 모든 대안은 참고용이다. 대안 점수에 상한(1순위 − 11)을 둔다.
+  - 예외 2: 수임처 고유 판단(이력·수정)이 이기면 타 수임처·전역 후보도 같은 상한을 받는다. 그래서 충돌을 만들지 못한다.
 - **AI 입력 최소화**: `AIClassificationInput`에는 상호·업종·적요·금액·증빙·방향·업종키·후보 계정·유사 예시만 들어간다. 적요는 `scrubSensitive`를 거친다. 카드 전체번호·주민번호·계좌는 넣지 않는다.
 
 ### 5.2 한 거래의 판단 순서
@@ -281,6 +295,8 @@ flowchart LR
 ```
 
 - `confidence_score = min(account.confidence, vat.confidence)` 이다(`transactions.confidence_score`).
+  - 부가세 공제 여부를 판단하지 못했으면(`deductible = null`) 부가세 신뢰도를 `quickReviewMin − 1`(기본 79) 이하로 낮춘다. 그래서 반드시 검토로 간다(`core/engine/decide.ts`).
+  - 부가세 규칙 신뢰도는 대부분 90~97이다. 그러므로 계정이 99여도 `confidence_score`는 보통 부가세 쪽 값이다.
 - `reviewLevelFor(score, policy, blockedByRisk)`:
   - 차단 위험이 없고 `score ≥ autoApproveMin(95)` 이면 `auto`. 상태는 `auto_approved`.
   - `score ≥ quickReviewMin(80)` 이면 `quick_review`. 빠른 검토 화면으로 간다.
@@ -370,35 +386,50 @@ flowchart LR
 ```
 source_d = export_d + duplicate_d + excluded_d + failed_d + pending_d
 residual_d = source_d − (export_d + duplicate_d + excluded_d + failed_d + pending_d)
-balanced ⇔ 모든 d에서 residual_d = 0   (1원도 허용하지 않음)
+balanced ⇔ 모든 d에서 residual_d = 0 ∧ 증빙별·계정별 소계 residual = 0 ∧ 모든 금액이 safe integer
 exportAllowed ⇔ balanced ∧ 미검토(pending_review) = 0 ∧ blocking 차이 = 0
+                ∧ export 합계 = 승인 거래 합계(4개 차원) ∧ 승인 거래 ≥ 1건
 ```
+
+`core/engine/reconcile.ts`의 `reconcile()`이 이 등식의 구현이고 기준이다.
 
 | 항 | 정의 | 데이터 |
 |---|---|---|
-| source | 해당 기간 가져오기의 **원본 행 전체** | `transaction_sources`, 검산용 `import_jobs.source_*_amount` |
-| export | 전송파일에 들어간 행 | `export_items` |
+| source | 대사 범위(아래)의 **원본 행 전체**. 여러 행이 한 거래로 묶였으면 한 단위로 센다 | `transaction_sources`, 검산용 `import_jobs.source_*_amount` |
+| export | 전송 전(`pre_export`): 승인 상태(`approved·auto_approved·exported·reconciled`) 거래. 파일 모드: 전송파일 행 금액 | 거래 / `export_items` |
 | duplicate | 중복으로 판정된 행(삭제 아님) | `transactions.status='duplicate'` ↔ `transaction_sources.outcome='duplicate'` |
 | excluded | 사람이 사유와 함께 제외 | `transactions.status='excluded'`, `excluded_reason` |
 | failed | 정규화 실패 행 | `transaction_sources.outcome='failed'` |
-| pending | 유효하지만 아직 전송파일에 없는 거래(미검토 포함) | `status in (imported, classified, needs_review, approved)` 중 export 미포함 |
+| pending | 유효하지만 전송(준비)에 들지 않은 거래(미검토 포함) | `status in (imported, classified, needs_review)` 또는 파일 모드에서 파일에 없는 승인 거래 |
 
-- 금액을 파싱할 수 없는 실패 행은 금액 차원을 닫을 수 없다. 그래서 `parse_failed`를 **blocking**으로 둔다. 사람이 원본을 고쳐 다시 가져오거나 "금액 확인 후 제외"로 처리해야 풀린다.
+- **`parse_failed`는 금액을 알든 모르든 항상 blocking이다**(core 구현). 실패 행이 하나라도 남아 있으면 그 수임처·기간은 전송할 수 없다.
+  - 풀어 주는 방법(원본 수정 후 재수집, "금액 확인 후 제외")을 기록할 컬럼이 아직 없다 → §14 G6.
 - 설명된 차이(`duplicate_excluded`, `user_excluded`)는 `blocking=false`다. 설명되지 않은 잔차는 `unexplained`이며 **blocking**이다.
 - 증빙유형별(`byEvidenceType`)과 계정별(`byAccount`) 소계도 각각 닫혀야 한다. 전체 합계가 우연히 상쇄되어 맞는 경우를 잡기 위해서다.
 - 계산은 전부 정수 합산(`sumWon`, `totalsEqual`)으로 한다. DB 집계는 `bigint`로 하고, JS로 옮길 때 safe integer인지 검사한다.
 
-예시 (수임처 1곳, 9월 카드):
+**대사 범위 (서버가 `reconcile()`에 넘기는 입력)** — 잘못 넘기면 멀쩡한 기간이 영구 차단되거나, 반대로 빠진 행이 숨는다.
+
+1. **수임처 × 기간 단위다.** 파일 모드에서는 그 기간 **모든 전송 종류**(`wehago_purchase_sales`, `wehago_general_journal`)의 최신 유효 버전 `export_items`를 합쳐서 넣는다. 한 종류만 넣으면 다른 종류로 갈 승인 거래가 전부 `pending`이 되어 차단된다.
+2. **전송 범위 밖 원천은 뺀다.** 수임처 설정이 `wehago_collects`인 원천([integration-architecture §8](./integration-architecture.md#8-이중-기장-방지--수임처별-전송-범위))은 파일로 내보내지 않는다. 이 원천의 원본 행과 거래를 전송 대사에 넣으면 "승인 거래 합계 ≠ 전송 합계"로 항상 막힌다.
+   - 이 원천은 따로 **검증 대사**를 돌린다. `exportRows` 없이 `wehagoRows`만 넣어 원본과 WEHAGO 역수입을 비교한다.
+3. **여러 달이 섞인 파일**(예: 홈택스 카드 분기 조회)은 행을 거래 `period`로 나눠 해당 기간에 넣는다.
+   - `transaction_sources`에는 기간 컬럼이 없다. 그래서 일자를 읽지 못한 실패 행은 `import_jobs.period` 기준으로 넣는다.
+   - `import_jobs.period`도 비어 있으면, 그 가져오기가 걸친 **모든 기간**에 blocking으로 넣는다. 한 기간에서만 빠지고 다른 기간에서도 안 보이는 일을 막는다(§14 G6).
+
+예시 (수임처 1곳, 9월 카드, 전송 전 `pre_export`):
 
 | 항 | 건수 | 합계 |
 |---|---:|---:|
 | source | 512 | 38,452,100 |
-| export | 500 | 37,980,000 |
+| export (전송준비 = 승인 거래) | 500 | 37,980,000 |
 | duplicate | 7 | 312,400 |
 | excluded | 3 | 120,000 |
 | failed | 2 | 39,700 |
 | pending | 0 | 0 |
-| **residual** | **0** | **0** → 균형 |
+| **residual** | **0** | **0** |
+
+→ `balanced = true`다. 그러나 실패 2건이 `parse_failed`(blocking)이므로 **`exportAllowed = false`**다. 두 행을 해소해야 파일을 만들 수 있다.
 
 ### 8.2 단계와 시점
 
@@ -406,15 +437,32 @@ exportAllowed ⇔ balanced ∧ 미검토(pending_review) = 0 ∧ blocking 차이
 |---|---|---|
 | `source` | 원본 합계 | 가져오기 직후 |
 | `processed` | 거래로 만들어진 행(중복·실패 제외) | 분류 후 |
-| `export` | 전송파일 행 | `export_wehago` 작업 안에서, 파일을 쓰기 **전**에 (`phase=pre_export`) |
+| `export` | 전송준비(승인 거래) → 전송파일 행 | `export_wehago` 작업 안에서 두 번 돈다. 파일을 쓰기 **전**(전송준비)과 쓴 **뒤**(파일에서 다시 읽은 행)다. 둘 다 `phase=pre_export` |
 | `wehago` | WEHAGO 매입매출장 엑셀 변환 파일(역수입) | 사람이 WEHAGO 업로드 후 (`phase=post_export`) |
 
-- 역수입 대사는 WEHAGO 중복전표 기준과 같은 키로 맞춘다. 키는 **일자 + 사업자번호 + 금액 + 과세유형**이다(research/01 §2.9 [공식]).
-  - 이 기준의 출처는 WEHAGO(Smart A 10) 도움말이다. WEHAGO T에도 같은지는 추론이므로 파일럿에서 확인한다.
-  - 결과는 `missing_in_wehago`, `extra_in_wehago`, `amount_mismatch`로 분류한다.
+- **역수입 매칭 키 (현재 core 구현)**: 1차 **일자 + 합계 + 정규화 상호**, 2차 **일자 + 합계**(상호 표기가 다른 경우)다. `ReconWehagoRow`에는 사업자번호 필드가 없다.
+  - 매칭 후 공급가액·부가세가 다르면 `amount_mismatch`(blocking)다. 계정코드가 다르면 `unexplained`(blocking)다.
+  - 전송했는데 WEHAGO에 없으면 `missing_in_wehago`(blocking)다. WEHAGO에만 있으면 `extra_in_wehago`(비차단, 알림)다.
+  - **개선 목표**: WEHAGO 중복전표 기준인 **일자 + 사업자번호 + 금액 + 과세유형**(research/01 §2.9 [공식])으로 올린다. 조건은 매입매출장 변환 파일에 사업자번호가 있는지 샘플로 확인하는 것이다(06 §5 U3). 이 기준의 출처는 WEHAGO(Smart A 10) 도움말이고, WEHAGO T에도 같은지는 추론이다.
+  - 2차 키(일자 + 합계)는 같은 날 같은 합계 거래가 여러 건이면 서로 바뀌어 매칭될 수 있다. 합계는 같으므로 전체 합계에는 영향이 없다. 다만 공급가액·부가세·계정 비교에서 거짓 불일치(blocking)가 날 수 있다. 이런 차이는 사람이 확인한다.
 - 원본 한 거래가 여러 행으로 들어오는 서식(예: 전자세금계산서 다중 품목 행 가능성, research/02 U6)은 어댑터가 묶음 키(승인번호)로 한 거래를 만든다. 이때 source **건수** 차원은 묶은 뒤 거래 단위로 센다. 묶음 규칙은 형식 프로파일에 명시한다.
 - `extra_in_wehago`는 WEHAGO T가 직접 수집한 전표일 수 있다. 이 경우 막지는 않고 알림(`recon_mismatch`)과 설명을 남긴다.
+  - **예외: 이중 기장 의심.** 이미 전송 행과 매칭된 WEHAGO 전표와 키가 같은 `extra_in_wehago`는 같은 전표가 두 번 올라간 것일 수 있다(§8.3). 예를 들어 v1과 v2를 둘 다 올린 경우다. 현재 core는 이것도 비차단으로 둔다 → §14 G8. 보완 전까지 서버는 이 경우를 high 알림으로 올린다.
 - 파일을 생성한 뒤에도 파일에서 **다시 읽은** 합계와 `export_items` 합계를 비교한다. 템플릿 렌더링 버그로 생기는 차이를 막는다.
+
+### 8.3 전송 버전과 정정 전송 (이중 기장 방지)
+
+core 대사는 **전송파일 합계 = 그 기간 승인 거래 전체 합계**를 요구한다(파일 모드). 그러므로 전송파일은 항상 **기간 전체 파일**이다. 이미 올린 거래를 빼는 증분 파일이 아니다. 이 때문에 다음 규칙이 필요하다.
+
+| 상황 | 규칙 |
+|---|---|
+| 이전 버전 vN이 `ready`(아무도 받지 않음) | vN+1을 만들면 vN은 무효다(`validation.supersededBy = vN+1`). vN은 다운로드할 수 없다 |
+| 이전 버전 vN이 `downloaded` | vN+1 생성 전에 경고한다: "v{N} 파일을 이미 받았습니다. WEHAGO에 올렸다면 새 파일을 올리기 전에 v{N} 전표를 지워야 합니다." |
+| 이전 버전 vN이 `uploaded_confirmed` | vN+1의 "업로드 완료 확인"에 **필수 확인 항목**을 둔다: "WEHAGO에서 v{N} 전표(행 N · 합계 X원)를 삭제했습니다." 확인 내용은 감사로그(`export.confirm_upload`, before/after에 vN 식별자)에 남긴다 |
+| 새 거래가 기간 중에 추가됨(늦게 들어온 카드 자료 등) | 위와 같다. 새 거래만 담은 증분 파일은 현재 대사 계약으로 검증할 수 없다 → §14 G7 |
+
+- 역수입 대사(`post_export`)는 최신 `uploaded_confirmed` 버전 기준이다. WEHAGO에 vN과 vN+1 전표가 함께 있으면 §8.2의 이중 기장 의심으로 드러나야 한다.
+- 정정 전송에는 `transactions.review`와 `export.create` 권한이 모두 필요하다. 이전 버전이 `uploaded_confirmed`이면 manager 이상이 한 번 더 확인하게 하는 것을 권장한다(4-eyes).
 
 ---
 
@@ -426,34 +474,40 @@ exportAllowed ⇔ balanced ∧ 미검토(pending_review) = 0 ∧ blocking 차이
 |---|---|---|---|
 | `import_file` | `fileId, clientId?, channel, formatProfile?` | 같은 `files.sha256` + 수임처면 기존 import로 연결. 행 단위는 fingerprint | 자식: `classify_batch` |
 | `classify_batch` | `clientId, importJobId \| transactionIds, engineVersion` | 사람 확정 상태는 덮어쓰지 않음(§4.2) | 500건 단위 청크, 진행률 갱신 |
-| `export_wehago` | `clientId, period, kind, templateKey` | 수임처·기간·종류별 advisory lock. 새로 만들 때마다 새 `export_jobs` 버전 | 내부에서 `pre_export` 대사 선행 |
+| `export_wehago` | `clientId, period, kind, templateKey` | 수임처·기간별 advisory lock. 새로 만들 때마다 새 `export_jobs` 버전이고, 이전 버전은 §8.3 규칙으로 무효화한다 | 내부에서 `pre_export` 대사 선행 |
 | `reconcile` | `clientId, period, phase, exportJobId?` | 결과를 추가 기록(이력 보존) | |
 | `payroll_prepare` | `payrollMonthId` | 월·직원 유일키(`payroll_items_month_emp_uq`) | 변동 분류, 신고 작업 생성 |
 | `ai_review` | `clientId, period, kind` | 같은 기간 재실행 시 새 행 | 선택 기능 |
-| `kpi_snapshot` | `period` | `system_metrics_client_period_uq` upsert | 야간 스케줄 |
+| `kpi_snapshot` | `period` | `system_metrics_client_period_uq` upsert(수임처 행만. 사무소 합계는 저장하지 않음 — §14 G10) | 야간 스케줄 |
 
 ### 9.2 획득·실행·재시도
 
 ```sql
--- 작업 획득 (jobs_queue_idx(status, run_after) 사용)
+-- 작업 획득 (jobs_queue_idx(status, run_after) 사용) — packages/server/src/jobs/queue.ts claimNextJob
 UPDATE jobs SET status = 'running', locked_by = $worker, locked_at = now(),
        started_at = coalesce(started_at, now()), attempts = attempts + 1
-WHERE id IN (
+WHERE id = (
   SELECT id FROM jobs
   WHERE status = 'queued' AND run_after <= now()
   ORDER BY run_after, created_at
-  LIMIT $batch
   FOR UPDATE SKIP LOCKED
+  LIMIT 1
 )
-RETURNING *;
+RETURNING id;
 ```
 
-- **동시성**: 워커 프로세스마다 `WORKER_CONCURRENCY`(기본 2)개를 실행한다. 대기 중이면 `WORKER_POLL_MS`(기본 1000ms)마다 폴링한다. `LISTEN/NOTIFY`로 즉시 깨우는 것은 최적화이며 필수가 아니다.
-- **하트비트**: 실행 중인 작업은 진행률을 갱신할 때 `locked_at`도 갱신한다(최소 30초마다). 리퍼는 1분마다 돌며, `running`이고 `locked_at`이 10분 넘게 갱신되지 않은 작업을 되돌린다. `attempts < max_attempts`면 `queued`, 아니면 `failed`다.
-- **재시도**: 일시 오류는 `run_after = now() + 30s × 2^(attempts−1)`(상한 15분)로 재시도한다. 사용자가 고쳐야 하는 오류(서식 불일치, 계정코드 없음)는 재시도하지 않고 바로 `failed` 또는 `partial`로 끝낸다. 이때 `error_message`에 **한국어 원인 + 다음 행동**을 적는다.
+아래 값은 2026-09-26 `packages/server/src/jobs/queue.ts`·`apps/worker/src/main.ts` 구현 기준이다. **"필수 보완"** 표시는 구현이 아직 설계를 따르지 않는 부분이다.
+
+- **동시성**: 워커 프로세스마다 `WORKER_CONCURRENCY`(기본 2)개 루프를 실행한다. 대기 중이면 `WORKER_POLL_MS`(기본 1000ms, 최소 200ms)마다 폴링한다. `LISTEN/NOTIFY`로 즉시 깨우는 것은 최적화이며 필수가 아니다.
+- **회수(리퍼)**: 1분마다, 그리고 워커 시작 시 돈다. `running`이고 `locked_at`이 **15분** 넘게 지난 작업을 `queued`로 되돌린다(`recoverStaleJobs`).
+- **하트비트 — 필수 보완**: 현재 `updateJobProgress`는 `locked_at`을 갱신하지 않는다. 그래서 15분 넘게 걸리는 정상 작업(대용량 가져오기 등)도 회수된다. 그러면 **다른 워커가 같은 작업을 동시에 다시 실행**한다. 이렇게 되면 원본 행이 두 번 적재되어 대사 source가 부풀 수 있다.
+  - 진행률을 갱신할 때 `locked_at = now()`도 함께 쓴다(최소 60초마다).
+  - 작업 처리기는 재실행에 멱등해야 한다. `import_file`은 같은 `import_job_id`에 이미 적재된 행 번호를 다시 쓰지 않는다(행 번호 기준 이어쓰기). 이미 쓴 행을 지우지 않는다.
+- **회수 상한 — 필수 보완**: 현재 회수는 `attempts`를 보지 않는다. 워커를 계속 죽이는 작업(메모리 초과 등)이 끝없이 반복된다. `attempts ≥ max_attempts`이면 `failed`로 끝내고 한국어 사유를 남겨야 한다.
+- **재시도**: 일시 오류는 `run_after = now() + min(300초, 5초 × 2^attempts)`로 재시도한다. 1회차 10초, 2회차 20초이고 상한은 5분이다. 오류에 `retryable: false`가 붙어 있으면(사용자가 고쳐야 하는 오류: 서식 불일치, 계정코드 없음) 재시도하지 않고 바로 `failed`로 끝낸다. 이때 `error_message`에 **한국어 원인 + 다음 행동**을 적는다.
 - **부분 성공**: 가져오기는 행 단위 실패가 있어도 나머지를 적재하고 `partial`로 끝낸다. 실패 행은 `transaction_sources`에 남는다.
-- **직렬화**: 같은 수임처·기간의 전송·대사는 `pg_advisory_xact_lock`으로 한 번에 하나만 실행한다.
-- **취소**: 청크 사이마다 `status = 'cancelled'`인지 확인한다.
+- **직렬화**: 같은 수임처·기간의 전송·대사는 `pg_advisory_xact_lock`으로 한 번에 하나만 실행한다. 잠금 키는 용도별 네임스페이스를 둔 2-키 형식이다(`pg_advisory_xact_lock(<용도 상수>, hashtext(client_id || period))`). 가져오기 중복 판정 잠금(04 §11.2)과 서로 막지 않게 하기 위해서다.
+- **취소**: 현재는 `queued` 작업만 취소할 수 있다(`cancelJob`). 실행 중 작업을 청크 사이에서 멈추는 것은 설계 목표다.
 - **종료**: SIGTERM을 받으면 새 작업 획득을 멈추고, 현재 청크를 끝낸 뒤 잠금을 푼다.
 - **스케줄**: 워커 안의 간단한 스케줄러가 `pg_try_advisory_lock`으로 리더를 뽑아 실행한다.
   - `kpi_snapshot`: 매일 02:00 KST
@@ -487,7 +541,7 @@ RETURNING *;
 | 감사 | 모든 사람 행동을 `audit_logs`에 before/after로 남긴다. 분류: `data_change / access / download / security / system`. 주민번호 열람은 `employee.view_sensitive`, 파일 다운로드는 `export.download`로 남긴다 | `server` |
 | 웹 | zod 입력 검증, 상태 변경 요청은 `Origin` 검사(CSRF), CSP, `frame-ancestors 'none'`, 로그인·Bridge 엔드포인트 요청 속도 제한 | `web` |
 | AI | 기본은 로컬 휴리스틱(외부 전송 없음). Anthropic은 `AI_PROVIDER=anthropic`일 때만 쓰고, 개인식별정보는 넣지 않는다. 국외 전송 고지 필요 여부는 검증필요 | `ai` |
-| Bridge | 기기별 페어링 토큰, 요청 HMAC 서명 + 타임스탬프 + nonce, OS 키체인 보관 | [desktop-bridge-design](./desktop-bridge-design.md) |
+| Bridge | 운영: 기기별 Ed25519 키쌍(서버는 공개키만 보관) + 요청 서명 + 타임스탬프 + nonce, 개인키는 OS 키체인. 프로토타입: 공용 HMAC 비밀(사내 시험 전용, 운영 환경에서는 거부) | [desktop-bridge-design](./desktop-bridge-design.md) |
 | 외부 인증정보 | 세무대리인 인증서, 홈택스·위멤버스 비밀번호는 **저장하지 않는다.** 로그인은 사람이 한다 | 정책 |
 
 ### 10.2 역할별 기본 권한 (제안 — `packages/security` 구현이 기준)
@@ -594,7 +648,7 @@ flowchart LR
   AI["AI Provider (선택, 외부)"]
 
   B -- HTTPS --> RP
-  BR -- "HTTPS + HMAC 서명" --> RP
+  BR -- "HTTPS + 기기 서명" --> RP
   RP --> WEB
   WEB --> PG
   WK --> PG
@@ -654,3 +708,8 @@ flowchart LR
 | G3 | Desktop Bridge 기기 등록 테이블이 없다 | 기기별 토큰 폐기·감사를 하기 어렵다 | 프로토타입은 `integration_connections(key='desktop_bridge').config_enc`에 기기 목록을 저장한다. 운영 전 `bridge_devices` 테이블을 추가한다 |
 | G4 | 레이아웃 지문(형식 프로파일) 레지스트리 테이블이 없다 | 새 서식을 등록하려면 코드를 배포해야 한다 | 초기에는 `adapters` 코드 상수로 둔다. 운영 중 추가가 잦으면 `format_profiles` 테이블을 둔다 |
 | G5 | `vat_rules`·`review_rules`에 효력일(`effective_from/to`)·근거 등급·출처 URL 컬럼이 없다. 세법 파라미터(세율·기한·한도)도 효력일 단위로 관리해야 한다(research/03 §4.3, research/04 §4.2) | 시한 있는 기준값(9/109, 의제매입 한도 특례, 근로 간이지급명세서 주기 전환 2027-01-01)을 날짜별로 적용할 수 없다 | 세법 파라미터는 `settings`에 효력일 구간 배열로 저장한다(예: key `tax_params`). 규칙 테이블에는 효력일 컬럼 추가를 계약 소유자와 결정한다. 그 전에는 규칙 `name`·`legal_basis`에 시한을 표기하고 만료 알림을 수동으로 둔다 |
+| G6 | **실패 행을 해소할 방법이 없다.** `transaction_sources.outcome='failed'`에는 "재수집으로 대체됨"·"금액 확인 후 제외" 같은 해소 상태가 없다. core `reconcile`은 `parse_failed`를 항상 blocking으로 둔다. 기간 컬럼도 없다(§8.1 대사 범위 3) | 실패 행이 1건이라도 생기면 그 수임처·기간은 **영구히 전송할 수 없다**. 원본을 고쳐 다시 올려도 옛 실패 행은 그대로 남는다 | `transaction_sources`에 `resolution`(`reimported`·`acknowledged_excluded`), `resolved_by`, `resolved_at`, `resolution_note`, `superseded_by_source_id`를 추가한다. core는 해소된 실패 행을 비차단 설명 차이로 바꾼다. 재수집으로 대체된 행은 source에서 빼고 대체 행으로 센다. 계약 변경 전까지는 실패 행이 생긴 기간은 전송하지 않는다(안전 측) |
+| G7 | 전송 **증분·무효 버전**을 표현할 수 없다. `export_jobs.status`에 `superseded`가 없다. core 대사는 기간 전체 파일만 검증한다 | 이미 올린 버전 뒤에 새 버전을 올리면 이중 기장 위험(§8.3) | `export_jobs.status`에 `superseded` 추가, 또는 `superseded_by_id` 컬럼 추가. 증분 전송을 하려면 대사에 "이전 업로드분" 항을 추가한다(`source = export(이번) + exported_before + …`) |
+| G8 | core `compareWehago`가 이중 업로드 사본을 `extra_in_wehago`(비차단)로 둔다 | 같은 전표가 WEHAGO에 두 번 있어도 대사가 통과할 수 있다 | 이미 매칭된 전송 행과 키가 같은 WEHAGO 행은 `extra_in_wehago` + `blocking=true`(또는 새 kind `duplicate_in_wehago`)로 올린다. core 계약 소유자가 결정한다 |
+| G9 | `clients` 삭제가 `employees`·`payroll_months`·`filing_jobs`(→ `filing_results`)·`classification_corrections`·규칙까지 CASCADE로 지운다(04 §9) | 거래가 없는 **급여 전용 수임처**를 실수로 물리 삭제하면 급여·원천세 신고 이력과 학습 데이터가 함께 사라진다 | 서비스 계층에서 `clients` 물리 삭제 API를 두지 않는다(`active=false`만). 운영 DB 계정에서 `DELETE ON clients` 권한을 뺀다 |
+| G10 | `system_metrics_client_period_uq`가 `client_id IS NULL` 행의 중복을 막지 못한다(04 §11.2) | 사무소 합계 행이 upsert되지 않고 쌓인다 | 사무소 합계는 저장하지 않고 조회 시 집계한다(02 §4.1과 같은 결론) |

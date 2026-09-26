@@ -160,7 +160,10 @@ export function isIpInCidr(ip: string | null | undefined, cidr: string): boolean
  * 목록이 있으면 IP 가 하나라도 일치해야 true. 잘못된 CIDR 항목은 무시(어떤 IP 와도 불일치).
  */
 export function isIpAllowed(ip: string | null | undefined, cidrs: readonly string[] | null | undefined): boolean {
-  if (!cidrs || cidrs.length === 0) return true;
+  if (cidrs === null || cidrs === undefined) return true;
+  // jsonb 컬럼에 배열이 아닌 값이 들어간 경우: 예외(500) 대신 거부 (fail closed)
+  if (!Array.isArray(cidrs)) return false;
+  if (cidrs.length === 0) return true;
   const parsed = parseIp(ip);
   if (!parsed) return false;
   for (const c of cidrs) {

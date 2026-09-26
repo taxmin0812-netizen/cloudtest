@@ -8,7 +8,7 @@ import type {
   ConditionField,
   ConditionLeaf,
   ConfidencePolicy,
-  CorrectionRecord,
+  Direction,
   HistoryEntry,
   LocalDate,
   MappingRule,
@@ -16,7 +16,7 @@ import type {
 } from '../types';
 import { describeCondition, evaluateCondition, type ConditionContext } from '../dsl';
 import { weekdayOf } from '../normalize';
-import { buildAccountMap, DEFAULT_ACCOUNT_CODES, isAccountCompatible } from '../data/accounts';
+import { accountDirection, buildAccountMap, DEFAULT_ACCOUNT_CODES, isAccountCompatible } from '../data/accounts';
 import { SYSTEM_DICTIONARY_BY_ID, SYSTEM_RULE_MAX_CONFIDENCE, systemDictionaryRules } from '../data/system-dictionary';
 import {
   applyCorrectionPriority,
@@ -24,12 +24,13 @@ import {
   buildCorrectionIndex,
   buildHistoryIndex,
   buildMerchantIndex,
-  compareCorrection,
+  countDirectionSignals,
   daysBetween,
   filterCompatible,
   historyKey,
   isoToKstDate,
   latestCorrectedEntry,
+  latestCorrectionPerTransaction,
   lookupCorrections,
   lookupMerchant,
   majorityAccountByCount,
@@ -37,6 +38,9 @@ import {
   tallyHistory,
   type CorrectionIndex,
   type CorrectionPoint,
+  type DirectedCorrectionRecord,
+  type DirectedHistoryEntry,
+  type DirectionSignals,
   type HistoryIndex,
   type HistoryStats,
   type MerchantIndex,
@@ -100,6 +104,15 @@ export interface ClassifyParams {
   amountDeviationMinHistory: number;
   /** 계정과목표에 없거나 비활성인 계정의 상한 */
   unknownAccountCap: number;
+  /** 상호만 같고 사업자번호가 다른 이력뿐일 때 상한 (동명의 다른 업체 가능 → 자동승인 제외) */
+  nameBiznoMismatchCap: number;
+  /**
+   * 학습 자료(이력·수정·업종)로 고른 계정이 자산·부채처럼 방향이 모호하고 매입/매출 근거가 없을 때 상한.
+   * 예: 매입만 해 온 거래처(쿠팡 → 상품)에 첫 매출 → 상품으로 자동승인되면 안 된다.
+   */
+  unconfirmedDirectionCap: number;
+  /** 위와 같으나 매출 거래일 때 (매출을 자산·부채로 잡으면 매출 누락 → 반드시 검토) */
+  unconfirmedSalesDirectionCap: number;
   /** 대안 신뢰도가 (1순위 − gap) 이상이면 계정 충돌 */
   conflictGap: number;
   maxAlternatives: number;
@@ -144,6 +157,9 @@ export const CLASSIFY_PARAMS: Readonly<ClassifyParams> = Object.freeze({
   amountDeviationPenalty: 5,
   amountDeviationMinHistory: 2,
   unknownAccountCap: 79,
+  nameBiznoMismatchCap: 94,
+  unconfirmedDirectionCap: 94,
+  unconfirmedSalesDirectionCap: 79,
   conflictGap: 10,
   maxAlternatives: 5,
 });
@@ -234,11 +250,11 @@ export interface ClassificationContextInput {
   client: ClientProfile;
   /** 이 거래처 규칙 + system_default 규칙 (DB). 다른 거래처 규칙은 무시된다 */
   rules: readonly MappingRule[];
-  /** 이 거래처의 확정 과거 거래 */
-  history: readonly HistoryEntry[];
+  /** 이 거래처의 확정 과거 거래 (direction 을 함께 주면 매입/매출을 엄격히 구분) */
+  history: readonly DirectedHistoryEntry[];
   /** 다른 거래처의 확정 과거 거래 (동일/전 업종) */
-  peerHistory: readonly HistoryEntry[];
-  corrections: readonly CorrectionRecord[];
+  peerHistory: readonly DirectedHistoryEntry[];
+  corrections: readonly DirectedCorrectionRecord[];
   /** 사무소 계정과목표. 비어 있으면 DEFAULT_ACCOUNT_CODES */
   accounts: readonly AccountCode[];
   policy: ConfidencePolicy;
@@ -296,14 +312,72 @@ function isUserRule(r: MappingRule, clientId: string): boolean {
   return r.status === 'active' && r.clientId === clientId && (r.origin === 'user' || r.origin === 'system_suggested');
 }
 
+const CONFIDENCE_PARAM_KEYS = [
+  'splitHistoryCap',
+  'minorityCap',
+  'industryStrongConfidence',
+  'industryWeakBase',
+  'industryTwoClients',
+  'industryOneClient',
+  'crossIndustryCap',
+  'systemRuleCap',
+  'unknownAccountCap',
+  'nameBiznoMismatchCap',
+  'unconfirmedDirectionCap',
+  'unconfirmedSalesDirectionCap',
+] as const;
+const RATIO_PARAM_KEYS = ['majorityMinRatio', 'industryMinAgreement'] as const;
+const NON_NEGATIVE_PARAM_KEYS = [
+  'splitPenaltyScale',
+  'correctedEntryWeight',
+  'recencyHalfLifeDays',
+  'industryMinClients',
+  'crossIndustryPenalty',
+  'shadowedRulePenalty',
+  'amountDeviationMultiplier',
+  'amountDeviationPenalty',
+  'amountDeviationMinHistory',
+  'conflictGap',
+  'maxAlternatives',
+] as const;
+const LADDER_PARAM_KEYS = ['exactHistoryLadder', 'nameHistoryLadder', 'correctionLadder'] as const;
+
+/**
+ * 사무소 설정(params)으로 덮어쓴 값 검증. 잘못된 값(예: 일치율 80 → 0.8 이어야 함)이 조용히 분류를 망치지 않도록
+ * 컨텍스트 생성 시점에 한국어 오류로 멈춘다.
+ */
+export function validateClassifyParams(p: ClassifyParams): void {
+  const fail = (key: string, why: string): never => {
+    throw new Error(`분류 파라미터 오류: ${key} ${why}`);
+  };
+  const finite = (v: unknown): v is number => typeof v === 'number' && Number.isFinite(v);
+  for (const k of CONFIDENCE_PARAM_KEYS) if (!finite(p[k]) || p[k] < 0 || p[k] > 100) fail(k, '는 0~100 사이 숫자여야 합니다');
+  for (const k of RATIO_PARAM_KEYS) if (!finite(p[k]) || p[k] < 0 || p[k] > 1) fail(k, '는 0~1 사이 비율이어야 합니다 (예: 80% → 0.8)');
+  for (const k of NON_NEGATIVE_PARAM_KEYS) if (!finite(p[k]) || p[k] < 0) fail(k, '는 0 이상 숫자여야 합니다');
+  if (p.correctionWindowDays !== null && (!finite(p.correctionWindowDays) || p.correctionWindowDays < 0)) {
+    fail('correctionWindowDays', '는 0 이상 숫자 또는 null(무제한)이어야 합니다');
+  }
+  if (p.systemRuleCap > SYSTEM_RULE_MAX_CONFIDENCE) fail('systemRuleCap', `는 ${SYSTEM_RULE_MAX_CONFIDENCE} 이하여야 합니다 (시스템 사전 자동승인 방지)`);
+  for (const k of LADDER_PARAM_KEYS) {
+    const steps = p[k];
+    if (!Array.isArray(steps) || steps.length === 0) fail(k, '는 1개 이상의 단계가 필요합니다');
+    for (const s of steps) {
+      if (!s || !finite(s.min) || s.min < 1 || !finite(s.confidence) || s.confidence < 0 || s.confidence > 100) {
+        fail(k, '의 각 단계는 min ≥ 1, confidence 0~100 이어야 합니다');
+      }
+    }
+  }
+}
+
 export function buildClassificationContext(input: ClassificationContextInput): ClassificationContext {
   const client = input.client;
   const params: ClassifyParams = { ...CLASSIFY_PARAMS };
   for (const [k, v] of Object.entries(input.params ?? {})) {
     if (v !== undefined) (params as unknown as Record<string, unknown>)[k] = v;
   }
+  validateClassifyParams(params);
   // 사다리는 건수 내림차순이어야 한다
-  for (const k of ['exactHistoryLadder', 'nameHistoryLadder', 'correctionLadder'] as const) {
+  for (const k of LADDER_PARAM_KEYS) {
     params[k] = [...params[k]].sort((a, b) => b.min - a.min);
   }
   const accounts = buildAccountMap(input.accounts.length > 0 ? input.accounts : DEFAULT_ACCOUNT_CODES);
@@ -444,21 +518,28 @@ interface HistoryResult {
   /** 방향 필터 후 전체 이력 */
   rawStats: HistoryStats;
   supersededCount: number;
+  /** 상호로 매칭했는데 이력이 모두 다른 사업자번호 (동명의 다른 업체 가능) */
   biznoMismatch: boolean;
+  /** 상호 매칭에서 제외한, 사업자번호가 다른 동명 이력 수 */
+  excludedOtherBizno: number;
   confidence: number;
   alternatives: Candidate[];
+  /** 유효 이력 중 거래 방향이 명시적으로 확인된 계정 */
+  explicitDirectionAccounts: ReadonlySet<string>;
 }
 
 interface CorrectionResult {
   accountCode: string;
   accountName: string;
   fromCode: string | null;
-  /** 최신 수정값과 같은 수정 반복 횟수 */
+  /** 최신 수정값과 같은 수정 반복 횟수 (거래 수 기준) */
   count: number;
-  /** 관련 수정 전체 수 */
+  /** 관련 수정 전체 수 (거래 수 기준) */
   total: number;
   date: LocalDate | null;
   confidence: number;
+  /** 최신 수정값과 같은 수정 중 거래 방향이 명시적으로 일치하는 것이 있음 */
+  explicitDirection: boolean;
 }
 
 interface PeerResult {
@@ -473,6 +554,7 @@ interface PeerResult {
   strong: boolean;
   cross: boolean;
   alternatives: Candidate[];
+  explicitDirection: boolean;
 }
 
 /** @internal */
@@ -481,6 +563,10 @@ export interface MerchantAnalysis {
   correction: CorrectionResult | null;
   industry: PeerResult | null;
   cross: PeerResult | null;
+  /** 이 거래처·상대방 이력의 매입/매출 근거 (방향 필터 전) */
+  ownSignals: DirectionSignals;
+  /** 타 거래처 동일 상대방 이력의 매입/매출 근거 */
+  peerSignals: DirectionSignals;
 }
 
 function ladder(steps: readonly ConfidenceStep[], count: number): number {
@@ -514,51 +600,71 @@ interface CorrectionEvent {
   after: string;
   afterName: string;
   before: string | null;
-  sortKey: string;
+  direction: Direction | null;
 }
 
-function correctionEvents(tx: NormalizedTransaction, ctx: ClassificationContext, group: readonly HistoryEntry[]): CorrectionEvent[] {
+/** 사업자번호가 둘 다 있고 다르면 다른 상대방 */
+function sameParty(tx: NormalizedTransaction, e: { merchantBusinessNumber: string | null }): boolean {
+  return !tx.merchantBusinessNumber || !e.merchantBusinessNumber || e.merchantBusinessNumber === tx.merchantBusinessNumber;
+}
+
+function correctionEvents(tx: NormalizedTransaction, ctx: ClassificationContext, group: readonly DirectedHistoryEntry[]): CorrectionEvent[] {
   const P = ctx.params;
   const asOf = ctx.asOfDate ?? tx.transactionDate;
-  const records: CorrectionRecord[] = lookupCorrections(ctx.corrections, tx).filter((c) => {
+  // 거래 1건당 최종 수정만 (같은 거래를 여러 번 고친 것은 반복 수정이 아니다)
+  const records = latestCorrectionPerTransaction(lookupCorrections(ctx.corrections, tx)).filter((c) => {
+    if (c.direction && c.direction !== tx.direction) return false;
     if (!isAccountCompatible(c.after, tx.direction, ctx.accounts)) return false;
     if (P.correctionWindowDays === null) return true;
     return daysBetween(isoToKstDate(c.createdAt), asOf) <= P.correctionWindowDays;
   });
   if (records.length > 0) {
-    return records.sort(compareCorrection).map((c, i) => ({
+    return records.map((c) => ({
       date: isoToKstDate(c.createdAt),
       after: c.after,
       afterName: '',
       before: c.before,
-      sortKey: String(i).padStart(8, '0'),
+      direction: c.direction ?? null,
     }));
   }
   // 수정 기록이 없으면 이력의 "수정 확정" 항목을 수정 사건으로 본다 (중복 계산 방지를 위해 둘 중 하나만)
   return group
     .filter((e) => e.corrected)
-    .map((e, i) => ({ date: e.transactionDate, after: e.accountCode, afterName: e.accountName, before: null, sortKey: String(i).padStart(8, '0') }));
+    .map((e) => ({ date: e.transactionDate, after: e.accountCode, afterName: e.accountName, before: null, direction: e.direction ?? null }));
 }
 
 function analyzeHistory(
   tx: NormalizedTransaction,
   ctx: ClassificationContext,
-): { result: HistoryResult | null; group: HistoryEntry[] } {
+): { result: HistoryResult | null; group: DirectedHistoryEntry[]; signals: DirectionSignals } {
   const P = ctx.params;
   const cid = ctx.client.id;
+  const rawBizno = tx.merchantBusinessNumber ? (ctx.history.byBizno.get(historyKey(cid, biznoKey(tx.merchantBusinessNumber))) ?? []) : [];
+  const rawName = tx.merchantKey ? (ctx.history.byKey.get(historyKey(cid, merchantNameKey(tx.merchantKey))) ?? []) : [];
+
+  // 같은 상대방의 전체 이력(방향 필터 전)으로 매입/매출 근거를 센다
+  const party = new Set<DirectedHistoryEntry>(rawBizno);
+  for (const e of rawName) if (sameParty(tx, e)) party.add(e);
+  const signals = countDirectionSignals(party, ctx.accounts);
+
   let level: HistoryResult['level'] = 'exact_history';
-  let group: HistoryEntry[] = [];
-  if (tx.merchantBusinessNumber) {
-    group = filterCompatible(ctx.history.byBizno.get(historyKey(cid, biznoKey(tx.merchantBusinessNumber))) ?? [], tx.direction, ctx.accounts);
-  }
+  let group = filterCompatible(rawBizno, tx.direction, ctx.accounts);
   let biznoMismatch = false;
-  if (group.length === 0 && tx.merchantKey) {
+  let excludedOtherBizno = 0;
+  if (group.length === 0 && rawName.length > 0) {
     level = 'name_history';
-    group = filterCompatible(ctx.history.byKey.get(historyKey(cid, merchantNameKey(tx.merchantKey))) ?? [], tx.direction, ctx.accounts);
-    biznoMismatch =
-      !!tx.merchantBusinessNumber && group.some((e) => !!e.merchantBusinessNumber && e.merchantBusinessNumber !== tx.merchantBusinessNumber);
+    const byName = filterCompatible(rawName, tx.direction, ctx.accounts);
+    const own = byName.filter((e) => sameParty(tx, e));
+    if (own.length > 0) {
+      group = own;
+      excludedOtherBizno = byName.length - own.length;
+    } else {
+      // 사업자번호가 모두 다른 동명 이력뿐 — 참고로 쓰되 자동승인은 막는다
+      group = byName;
+      biznoMismatch = byName.length > 0;
+    }
   }
-  if (group.length === 0) return { result: null, group };
+  if (group.length === 0) return { result: null, group, signals };
 
   const opts = tallyOpts(ctx);
   const rawStats = tallyHistory(group, opts);
@@ -571,19 +677,26 @@ function analyzeHistory(
   const lce = latestCorrectedEntry(group);
   if (lce && (!point || lce.transactionDate > point.date)) point = { date: lce.transactionDate, accountCode: lce.accountCode };
 
-  const { effective, superseded } = applyCorrectionPriority(group, point, majorityAccountByCount(group));
+  // 기준 계정: 이력이 실제로 추천할 계정(가중 다수)이 최신 수정과 다르면 그것, 아니면 건수 다수.
+  // (건수 다수만 보면 "건수는 수정값이 많지만 최근 가중치는 옛 계정" 인 경우 같은 실수를 반복 추천한다)
+  const weighted = rawStats.dominant?.accountCode ?? null;
+  const reference = point && weighted !== null && weighted !== point.accountCode ? weighted : majorityAccountByCount(group);
+  const { effective, superseded } = applyCorrectionPriority(group, point, reference);
   const steps = level === 'exact_history' ? P.exactHistoryLadder : P.nameHistoryLadder;
+  const base = { level, rawStats, supersededCount: superseded.length, biznoMismatch, excludedOtherBizno };
   if (effective.length === 0) {
     return {
-      result: { level, stats: null, rawStats, supersededCount: superseded.length, biznoMismatch, confidence: 0, alternatives: [] },
+      result: { ...base, stats: null, confidence: 0, alternatives: [], explicitDirectionAccounts: new Set() },
       group,
+      signals,
     };
   }
   const stats = tallyHistory(effective, opts);
   const totalWeight = stats.tallies.reduce((s, t) => s + t.weight, 0);
   const allSame = stats.tallies.length === 1;
   const dom = stats.dominant!;
-  const confidence = historyConfidence(dom.count, totalWeight > 0 ? dom.weight / totalWeight : 0, allSame, steps, P);
+  let confidence = historyConfidence(dom.count, totalWeight > 0 ? dom.weight / totalWeight : 0, allSame, steps, P);
+  if (biznoMismatch) confidence = Math.min(confidence, P.nameBiznoMismatchCap);
   const alternatives: Candidate[] = stats.tallies.slice(1).map((t) => ({
     source: level,
     accountCode: t.accountCode,
@@ -592,18 +705,26 @@ function analyzeHistory(
     confidence: Math.min(confidence, historyConfidence(t.count, totalWeight > 0 ? t.weight / totalWeight : 0, false, steps, P)),
     tier: 'client',
   }));
+  const explicitDirectionAccounts = new Set<string>();
+  for (const e of effective) if (e.direction === tx.direction) explicitDirectionAccounts.add(e.accountCode);
   return {
-    result: { level, stats, rawStats, supersededCount: superseded.length, biznoMismatch, confidence, alternatives },
+    result: { ...base, stats, confidence, alternatives, explicitDirectionAccounts },
     group,
+    signals,
   };
 }
 
-function analyzeCorrection(tx: NormalizedTransaction, ctx: ClassificationContext, group: readonly HistoryEntry[]): CorrectionResult | null {
+function analyzeCorrection(tx: NormalizedTransaction, ctx: ClassificationContext, group: readonly DirectedHistoryEntry[]): CorrectionResult | null {
   const events = correctionEvents(tx, ctx, group);
   const latest = events[events.length - 1];
   if (!latest) return null;
   let count = 0;
-  for (const e of events) if (e.after === latest.after) count += 1;
+  let explicitDirection = false;
+  for (const e of events) {
+    if (e.after !== latest.after) continue;
+    count += 1;
+    if (e.direction === tx.direction) explicitDirection = true;
+  }
   return {
     accountCode: latest.after,
     accountName: accountNameOf(latest.after, latest.afterName, ctx),
@@ -612,6 +733,7 @@ function analyzeCorrection(tx: NormalizedTransaction, ctx: ClassificationContext
     total: events.length,
     date: latest.date,
     confidence: ladder(ctx.params.correctionLadder, count),
+    explicitDirection,
   };
 }
 
@@ -624,7 +746,12 @@ function peerConfidence(clientCount: number, share: number, P: ClassifyParams): 
   return P.industryOneClient;
 }
 
-function summarizePeers(byClient: Map<string, HistoryEntry[]>, cross: boolean, ctx: ClassificationContext): PeerResult | null {
+function summarizePeers(
+  byClient: Map<string, DirectedHistoryEntry[]>,
+  cross: boolean,
+  tx: NormalizedTransaction,
+  ctx: ClassificationContext,
+): PeerResult | null {
   if (byClient.size === 0) return null;
   const P = ctx.params;
   const opts = tallyOpts(ctx);
@@ -664,6 +791,13 @@ function summarizePeers(byClient: Map<string, HistoryEntry[]>, cross: boolean, c
     confidence: Math.min(confidence, clampConfidence(adjust(peerConfidence(clientCount, v.clients / clientCount, P)))),
     tier: 'global',
   }));
+  let explicitDirection = false;
+  for (const entries of byClient.values()) {
+    if (entries.some((e) => e.accountCode === top[0] && e.direction === tx.direction)) {
+      explicitDirection = true;
+      break;
+    }
+  }
   return {
     accountCode: top[0],
     accountName: accountNameOf(top[0], top[1].name, ctx),
@@ -676,36 +810,41 @@ function summarizePeers(byClient: Map<string, HistoryEntry[]>, cross: boolean, c
     strong: clientCount >= P.industryMinClients && share >= P.industryMinAgreement,
     cross,
     alternatives,
+    explicitDirection,
   };
 }
 
-function analyzePeers(tx: NormalizedTransaction, ctx: ClassificationContext): { industry: PeerResult | null; cross: PeerResult | null } {
-  const entries = lookupMerchant(ctx.peers, tx).filter(
+function analyzePeers(
+  tx: NormalizedTransaction,
+  ctx: ClassificationContext,
+): { industry: PeerResult | null; cross: PeerResult | null; signals: DirectionSignals } {
+  // 사업자번호가 서로 다르면 동명의 다른 상대방
+  const party = lookupMerchant(ctx.peers, tx).filter((e) => e.clientId !== ctx.client.id && sameParty(tx, e));
+  const signals = countDirectionSignals(party, ctx.accounts);
+  const entries = party.filter(
     (e) =>
-      e.clientId !== ctx.client.id &&
-      // 사업자번호가 서로 다르면 동명의 다른 상대방
-      !(tx.merchantBusinessNumber && e.merchantBusinessNumber && e.merchantBusinessNumber !== tx.merchantBusinessNumber) &&
+      (!e.direction || e.direction === tx.direction) &&
       isAccountCompatible(e.accountCode, tx.direction, ctx.accounts) &&
       isUsableAccount(e.accountCode, ctx),
   );
-  if (entries.length === 0) return { industry: null, cross: null };
-  const all = new Map<string, HistoryEntry[]>();
-  const same = new Map<string, HistoryEntry[]>();
+  if (entries.length === 0) return { industry: null, cross: null, signals };
+  const all = new Map<string, DirectedHistoryEntry[]>();
+  const same = new Map<string, DirectedHistoryEntry[]>();
   for (const e of entries) {
     (all.get(e.clientId) ?? all.set(e.clientId, []).get(e.clientId)!).push(e);
     if (e.industry === ctx.client.industry) (same.get(e.clientId) ?? same.set(e.clientId, []).get(e.clientId)!).push(e);
   }
-  return { industry: summarizePeers(same, false, ctx), cross: summarizePeers(all, true, ctx) };
+  return { industry: summarizePeers(same, false, tx, ctx), cross: summarizePeers(all, true, tx, ctx), signals };
 }
 
 function merchantAnalysis(tx: NormalizedTransaction, ctx: ClassificationContext): MerchantAnalysis {
   const key = `${tx.direction}|${tx.merchantBusinessNumber ?? ''}|${tx.merchantKey}`;
   const hit = ctx.cache.get(key);
   if (hit) return hit;
-  const { result: history, group } = analyzeHistory(tx, ctx);
+  const { result: history, group, signals: ownSignals } = analyzeHistory(tx, ctx);
   const correction = analyzeCorrection(tx, ctx, group);
-  const { industry, cross } = analyzePeers(tx, ctx);
-  const a: MerchantAnalysis = { history, correction, industry, cross };
+  const { industry, cross, signals: peerSignals } = analyzePeers(tx, ctx);
+  const a: MerchantAnalysis = { history, correction, industry, cross, ownSignals, peerSignals };
   ctx.cache.set(key, a);
   return a;
 }
@@ -733,13 +872,59 @@ const LEVEL_LABEL: Partial<Record<ClassificationSource, string>> = {
   system_rule: '시스템 기본사전',
 };
 
+interface DirectionSupport {
+  /** 1순위 계정을 뒷받침하는 자료 중 거래 방향이 명시적으로 일치하는 것이 있음 */
+  explicit: boolean;
+  /** 같은 상대방 자료의 매입/매출 근거 수 */
+  signals: DirectionSignals;
+}
+
 interface Winner {
   candidate: Candidate;
   facts: Omit<ExplainFacts, 'source' | 'merchantName' | 'accountName' | 'evidence'>;
   evidence: ClassificationEvidence;
   /** 이력 기반 금액 점검 대상 통계 */
   amountStats: HistoryStats | null;
+  /** 학습 자료(이력·수정·업종)·사용자 규칙일 때 — 매입/매출 방향 확인용 */
+  direction?: DirectionSupport;
+  /** 방향 미확인 시 덧붙일 안내 */
+  directionHint?: string;
+  /** 근거 목록에 덧붙일 문장 */
+  notes?: string[];
 }
+
+/**
+ * 1순위 계정의 매입/매출 방향이 확인되지 않으면 경고 문구를 돌려준다.
+ * - 비용·원가(매입), 수익(매출) 계정은 계정 성격으로 방향이 확정된다.
+ * - 자산·부채 등 모호한 계정: 자료(규칙 조건)에 방향이 명시되어 있거나, 매입 거래이면서 상대방에 매출 근거가 전혀 없을 때만 확인된 것으로 본다.
+ */
+function directionWarning(
+  accountCode: string,
+  accountName: string,
+  support: DirectionSupport,
+  tx: NormalizedTransaction,
+  ctx: ClassificationContext,
+  hint?: string,
+): string | null {
+  if (accountDirection(accountCode, ctx.accounts) === tx.direction || support.explicit) return null;
+  if (tx.direction === 'purchase' && support.signals.sales === 0) return null;
+  const base =
+    tx.direction === 'sales'
+      ? `매입/매출 방향 미확인: 매출 거래에 ${accountName} 계정 적용 — 확인 필요`
+      : `매입/매출 방향 미확인: 매출 이력도 있는 상대방 — ${accountName} 확인 필요`;
+  return hint ? `${base} (${hint})` : base;
+}
+
+/** 조건이 direction 필드를 참조하는가 (규칙 작성자가 매입/매출을 지정했는가) */
+function conditionMentionsDirection(cond: Condition): boolean {
+  if (!cond || typeof cond !== 'object') return false;
+  if ('all' in cond) return Array.isArray(cond.all) && cond.all.some(conditionMentionsDirection);
+  if ('any' in cond) return Array.isArray(cond.any) && cond.any.every(conditionMentionsDirection);
+  if ('not' in cond) return false;
+  return (cond as ConditionLeaf).field === 'direction';
+}
+
+const NO_SIGNALS: DirectionSignals = Object.freeze({ purchase: 0, sales: 0 });
 
 function historyEvidence(stats: HistoryStats | null, accountCode: string | null): ClassificationEvidence {
   if (!stats || stats.total === 0) return { historyCount: 0 };
@@ -790,12 +975,13 @@ function peerEvidence(p: PeerResult): ClassificationEvidence {
   return ev;
 }
 
-function peerWinner(p: PeerResult, industryLabel: string): Winner {
+function peerWinner(p: PeerResult, industryLabel: string, signals: DirectionSignals): Winner {
   return {
     candidate: peerCandidate(p),
     facts: { industryLabel, crossIndustry: p.cross, agreeingClientCount: p.agreeingClients },
     evidence: peerEvidence(p),
     amountStats: null,
+    direction: { explicit: p.explicitDirection, signals },
   };
 }
 
@@ -840,6 +1026,9 @@ export function classifyAccount(tx: NormalizedTransaction, ctx: ClassificationCo
       facts: { ruleName: topUser.rule.name, ruleConditionText: safeDescribe(topUser.rule.condition), rulePriority: topUser.rule.priority },
       evidence: { ruleId: topUser.rule.id, ruleName: topUser.rule.name, ...historyEvidence(hist?.stats ?? hist?.rawStats ?? null, topUser.rule.accountCode) },
       amountStats: null,
+      // 사용자 규칙은 매입 거래에서는 그대로 신뢰. 방향 조건 없는 규칙이 매출 거래에 자산·부채 계정을 주면 확인 요청
+      direction: { explicit: conditionMentionsDirection(topUser.rule.condition), signals: NO_SIGNALS },
+      directionHint: '규칙에 매입/매출 방향 조건 추가 권장',
     };
   } else if (hist?.stats?.dominant || corr) {
     const d = hist?.stats?.dominant ?? null;
@@ -859,6 +1048,10 @@ export function classifyAccount(tx: NormalizedTransaction, ctx: ClassificationCo
         facts: { correction: correctionFacts(corr, ctx), supersededCount: hist?.supersededCount ?? 0 },
         evidence: historyEvidence(stats, corrCand.accountCode),
         amountStats: stats,
+        direction: {
+          explicit: !!corr?.explicitDirection || !!hist?.explicitDirectionAccounts.has(corrCand.accountCode),
+          signals: ma.ownSignals,
+        },
       };
     } else if (histCand && hist?.stats) {
       winner = {
@@ -871,10 +1064,15 @@ export function classifyAccount(tx: NormalizedTransaction, ctx: ClassificationCo
         },
         evidence: historyEvidence(hist.stats, histCand.accountCode),
         amountStats: hist.stats,
+        direction: { explicit: hist.explicitDirectionAccounts.has(histCand.accountCode), signals: ma.ownSignals },
+        notes: [
+          ...(hist.excludedOtherBizno > 0 ? [`사업자번호가 다른 동명 이력 ${hist.excludedOtherBizno}건 제외`] : []),
+          ...(hist.biznoMismatch ? ['사업자번호가 다른 동명 업체의 이력뿐 — 자동승인 제외'] : []),
+        ],
       };
     }
   }
-  if (!winner && ma.industry?.strong) winner = peerWinner(ma.industry, industryLabel);
+  if (!winner && ma.industry?.strong) winner = peerWinner(ma.industry, industryLabel, ma.peerSignals);
   const topSys = sysMatches[0];
   if (!winner && topSys) {
     winner = {
@@ -886,7 +1084,7 @@ export function classifyAccount(tx: NormalizedTransaction, ctx: ClassificationCo
   }
   if (!winner) {
     const weak = [ma.industry, ma.cross].filter((p): p is PeerResult => !!p).sort((a, b) => b.confidence - a.confidence || (a.cross ? 1 : 0) - (b.cross ? 1 : 0));
-    if (weak[0]) winner = peerWinner(weak[0], industryLabel);
+    if (weak[0]) winner = peerWinner(weak[0], industryLabel, ma.peerSignals);
   }
 
   const correctionCount = corr?.total ?? 0;
@@ -910,7 +1108,7 @@ export function classifyAccount(tx: NormalizedTransaction, ctx: ClassificationCo
   // ── 보정: 금액 이상치, 계정표 확인 ──
   const w = winner.candidate;
   let confidence = w.confidence;
-  const warnings: string[] = [];
+  const warnings: string[] = [...(winner.notes ?? [])];
   let amount: ExplainFacts['amount'] = null;
   const st = winner.amountStats;
   if (st && st.averageAmount !== null && st.averageAmount > 0 && st.total >= P.amountDeviationMinHistory) {
@@ -926,6 +1124,13 @@ export function classifyAccount(tx: NormalizedTransaction, ctx: ClassificationCo
   } else if (!acc.active) {
     warnings.push(`비활성 계정(${acc.code} ${acc.name}) — 계정 확인 필요`);
     confidence = Math.min(confidence, P.unknownAccountCap);
+  }
+  if (winner.direction) {
+    const warn = directionWarning(w.accountCode, acc?.name ?? w.accountName, winner.direction, tx, ctx, winner.directionHint);
+    if (warn) {
+      warnings.push(warn);
+      confidence = Math.min(confidence, tx.direction === 'sales' ? P.unconfirmedSalesDirectionCap : P.unconfirmedDirectionCap);
+    }
   }
   confidence = clampConfidence(confidence);
 

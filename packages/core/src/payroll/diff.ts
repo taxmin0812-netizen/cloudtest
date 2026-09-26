@@ -79,16 +79,28 @@ function maxSeverity(a: RiskSeverity, b: RiskSeverity): RiskSeverity {
   return SEVERITY_RANK[a] >= SEVERITY_RANK[b] ? a : b;
 }
 
-/** 같은 직원의 지급행이 여러 건이면 합산 (상여 별도 지급 등) */
-function mergeLines(lines: PayrollLine[]): Map<string, { line: PayrollLine; count: number }> {
-  const map = new Map<string, { line: PayrollLine; count: number }>();
+export interface MergedEmployeeLine {
+  line: PayrollLine;
+  /** 합산된 지급행 수 */
+  count: number;
+  /** 합산된 행들의 소득구분 (2개 이상이면 소득구분 혼재) */
+  incomeTypes: Set<IncomeType>;
+}
+
+/**
+ * 같은 직원의 지급행이 여러 건이면 합산 (상여 별도 지급 등). 키: 'id:<employeeId>' / ID 없는 행은 'noid:<index>'.
+ * 소득구분이 다른 행도 합산되므로 incomeTypes 로 혼재 여부를 반드시 확인한다 (첫 행의 소득구분을 유지).
+ */
+export function mergeEmployeeLines(lines: PayrollLine[]): Map<string, MergedEmployeeLine> {
+  const map = new Map<string, MergedEmployeeLine>();
   lines.forEach((l, idx) => {
     const key = l.employeeId ? `id:${l.employeeId}` : `noid:${idx}`;
     const prev = map.get(key);
     if (!prev) {
-      map.set(key, { line: { ...l, allowances: { ...l.allowances } }, count: 1 });
+      map.set(key, { line: { ...l, allowances: { ...l.allowances } }, count: 1, incomeTypes: new Set([l.incomeType]) });
       return;
     }
+    prev.incomeTypes.add(l.incomeType);
     const a = prev.line;
     const allowances = { ...a.allowances };
     for (const [k, v] of Object.entries(l.allowances)) allowances[k] = (allowances[k] ?? 0) + v;
@@ -164,6 +176,13 @@ function comparePay(prev: PayrollLine, curr: PayrollLine, largePct: number): Pay
       if (pd !== cd) {
         messages.push(`근무일수 ${pd}일 → ${cd}일 (일당 ${formatWon(currWage)} 동일), 지급액 ${formatWon(prev.grossPay)} → ${formatWon(curr.grossPay)}`);
       }
+      // 일당은 같아도 과세/비과세 비율이 바뀌면 세액이 달라진다
+      if (prev.taxablePay * cd !== curr.taxablePay * pd) {
+        messages.push(
+          `일당 동일, 과세/비과세 구성 변경: 1일 과세 ${formatWon(Math.round(prev.taxablePay / pd))} → ${formatWon(Math.round(curr.taxablePay / cd))}`,
+        );
+        return { changed: true, large: false, rate, messages };
+      }
       return { changed: false, large: false, rate, messages };
     }
     // 일당 증감률은 정확한 분수로 계산
@@ -210,6 +229,10 @@ function describeAllowanceDiff(prev: Record<string, number>, curr: Record<string
  */
 export function diffPayroll(prev: PayrollMonthData, curr: PayrollMonthData, opts: DiffOptions = {}): PayrollDiffResult {
   const largePct = opts.largeChangePct ?? 20;
+  if (!Number.isFinite(largePct) || largePct < 0) {
+    // 잘못된 설정값으로 전원이 '급변'이 되거나 아무도 걸리지 않는 일을 막는다
+    throw new Error(`급여 증감률 임계치는 0 이상의 숫자여야 합니다: ${largePct}`);
+  }
   const period = opts.period ?? inferPeriod(curr.lines);
   const periodStart = period ? `${period}-01` : null;
   const periodEnd = period ? `${period}-31` : null; // 문자열 비교용 상한
@@ -218,12 +241,12 @@ export function diffPayroll(prev: PayrollMonthData, curr: PayrollMonthData, opts
   for (const e of prev.employees) empById.set(e.employeeId, e);
   for (const e of curr.employees) empById.set(e.employeeId, e); // 이번달 마스터 우선
 
-  const prevMap = mergeLines(prev.lines);
-  const currMap = mergeLines(curr.lines);
+  const prevMap = mergeEmployeeLines(prev.lines);
+  const currMap = mergeEmployeeLines(curr.lines);
   const changes: PayrollChange[] = [];
 
   // 이번달 지급행 기준
-  for (const [key, { line: c, count }] of currMap) {
+  for (const [key, { line: c, count, incomeTypes }] of currMap) {
     const p = key.startsWith('id:') ? prevMap.get(key)?.line ?? null : null;
     const emp = c.employeeId ? empById.get(c.employeeId) : undefined;
     const kinds: PayrollChangeKind[] = [];
@@ -243,10 +266,20 @@ export function diffPayroll(prev: PayrollMonthData, curr: PayrollMonthData, opts
     else if (!emp) add('missing_id', '직원 마스터에 없는 직원 — 등록 필요');
     else if (!emp.hasIdNumber) add('missing_id', '주민(외국인)등록번호 미등록 — 신고 불가');
 
+    // 소득구분: 이번달 행끼리 혼재 / 직원 마스터와 불일치 (원천징수 방식이 달라지므로 high)
+    if (incomeTypes.size > 1) {
+      const labels = [...incomeTypes].map((t) => INCOME_TYPE_LABELS[t]).join('·');
+      add('income_type_changed', `이번달 지급내역에 소득구분 혼재(${labels}) — 합산 비교됨, 소득구분별 행 분리·원천징수 방식 확인`);
+    }
+    if (emp && emp.incomeType !== c.incomeType) {
+      add('income_type_changed', `직원 마스터 소득구분(${INCOME_TYPE_LABELS[emp.incomeType]})과 지급내역(${INCOME_TYPE_LABELS[c.incomeType]}) 불일치`);
+    }
+
     // 신규/재지급
     if (!p) {
       const hire = emp?.hireDate ?? null;
       if (hire && period && yearMonthOf(hire) === period) add('new_hire', `신규입사 (입사일 ${hire})`);
+      else if (hire && periodEnd && hire > periodEnd) add('new_hire', `입사일(${hire}) 이전 지급 — 입사일·귀속월 확인`);
       else if (hire) add('new_hire', `전월 지급내역 없음 (입사일 ${hire}) — 재입사/복귀 여부 확인`);
       else add('new_hire', '전월 지급내역 없음 — 신규 여부 확인');
       messages.push(`${PAY_LABEL[c.incomeType]} ${formatWon(c.grossPay)}${c.incomeType === 'daily' && c.workDays ? ` (${c.workDays}일)` : ''}`);
@@ -263,8 +296,9 @@ export function diffPayroll(prev: PayrollMonthData, curr: PayrollMonthData, opts
       messages.unshift(...cmp.messages);
     }
 
-    // 무급
+    // 무급 / 음수
     if (c.grossPay === 0) add('zero_pay', '지급액 0원 — 휴직/무급 여부 확인');
+    else if (c.grossPay < 0) add('zero_pay', `지급액 음수(${formatWon(c.grossPay)}) — 환수/정정 내역 확인`);
 
     // 퇴사
     const resign = emp?.resignDate ?? null;
@@ -305,7 +339,7 @@ export function diffPayroll(prev: PayrollMonthData, curr: PayrollMonthData, opts
       incomeType: p.incomeType,
       previous: p,
       current: null,
-      changeRate: -100,
+      changeRate: changeRatePct(p.grossPay, 0),
     };
     if (resign && periodStart && resign < periodStart) {
       // 전월 이전 퇴사 확정 — 이번달 지급 없음이 정상

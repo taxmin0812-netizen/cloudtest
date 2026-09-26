@@ -296,13 +296,16 @@ export function toUserError(e: unknown, opts: { errorId?: string } = {}): UserFa
     const out: UserFacingError = {
       httpStatus: e.httpStatus,
       code: e.code,
-      message: withRef(e.userMessage, e.httpStatus),
+      // userMessage 에 입력값이 끼어들 수 있으므로 (예: NotFoundError(원문)) 여기서도 민감정보를 스크럽한다
+      message: withRef(scrubSensitive(e.userMessage), e.httpStatus),
       errorId,
       retryable: e.retryable,
     };
     if (e.action) out.action = { ...e.action };
     if (e instanceof RateLimitError) out.retryAfterSeconds = e.retryAfterSeconds;
-    if (e instanceof ValidationError && e.fieldErrors.length > 0) out.fieldErrors = e.fieldErrors.map((f) => ({ ...f }));
+    if (e instanceof ValidationError && e.fieldErrors.length > 0) {
+      out.fieldErrors = e.fieldErrors.map((f) => ({ field: f.field, message: scrubSensitive(f.message) }));
+    }
     return out;
   }
 

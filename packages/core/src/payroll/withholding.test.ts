@@ -7,6 +7,7 @@ import {
   computeDailyWorkerWithholding,
   computeLineWithholding,
   dailyWagesOfLine,
+  earnedZeroTaxIssue,
   estimateEarnedIncomeTaxRough,
   localIncomeTaxOf,
   resolveWithholdingParams,
@@ -272,5 +273,89 @@ describe('검증용 추정(간이세액표 아님)', () => {
   });
   it('저소득(월 100만원) → 0원', () => {
     expect(estimateEarnedIncomeTaxRough(1_000_000).incomeTax).toBe(0);
+  });
+});
+
+describe('리뷰 보완 — 입력 검증·무음 손실 방지', () => {
+  it('applyRate: 원 단위 정수가 아니면 한국어 오류', () => {
+    expect(() => applyRate(1_000.5, 0.03)).toThrow('원 단위 정수');
+    expect(() => computeBusinessWithholding(1_000_000.4)).toThrow('원 단위 정수');
+  });
+  it('일용: 소수 근무일수는 조용히 버리지 않고 오류', () => {
+    expect(() => computeDailyWorkerWithholding({ dailyWage: 200_000, workDays: 2.5 })).toThrow('근무일수');
+    expect(() => computeDailyWorkerWithholding({ dailyWage: 200_000, workDays: -1 })).toThrow('근무일수');
+  });
+  it('일용: wageGroups 입력 = dailyWages 입력, 근무일수만큼 배열을 만들지 않음', () => {
+    const a = computeDailyWorkerWithholding({ wageGroups: [{ dailyWage: 200_000, days: 3 }, { dailyWage: 187_000, days: 2 }] });
+    const b = computeDailyWorkerWithholding({ dailyWages: [200_000, 187_000, 200_000, 187_000, 200_000] });
+    expect(a.incomeTax).toBe(b.incomeTax);
+    expect(a.incomeTax).toBe(6_040); // 1,350×3 + 999×2 = 6,048 → 6,040
+    expect(a.workDays).toBe(5);
+    expect(a.totalWage).toBe(974_000);
+    const huge = computeDailyWorkerWithholding({ dailyWage: 200_000, workDays: 5_000_000 });
+    expect(huge.incomeTax).toBe(6_750_000_000);
+    expect(huge.workDays).toBe(5_000_000);
+  });
+  it('일용: 원 미만 절사 안 함(none) 설정 시 1일 세액 표시는 소수 유지', () => {
+    const r = computeDailyWorkerWithholding({ dailyWage: 190_500, workDays: 1 }, { daily: { perDayRounding: 'none' } });
+    expect(r.perDay[0]!.taxPerDay).toBe(1_093.5);
+  });
+  it('급여행: 소수 근무일수 → daily_invalid_days(high), 31일 초과 → 경고', () => {
+    const bad = computeLineWithholding(line({ incomeType: 'daily', taxablePay: 500_000, workDays: 2.5, incomeTax: 100, localIncomeTax: 10 }));
+    expect(bad.source).toBe('unavailable');
+    expect(bad.incomeTax).toBe(100);
+    expect(bad.issues[0]).toMatchObject({ code: 'daily_invalid_days', severity: 'high' });
+    const many = computeLineWithholding(line({ incomeType: 'daily', taxablePay: 200_000 * 40, workDays: 40 }));
+    expect(many.issues.map((i) => i.code)).toContain('daily_days_exceed_month');
+    expect(many.incomeTax).toBe(54_000);
+  });
+  it('급여행: 금액이 정수가 아니면 계산하지 않고 invalid_amount(high) — 예외로 배치 중단하지 않음', () => {
+    const w = computeLineWithholding(line({ incomeType: 'business', taxablePay: 1_000_000.5, grossPay: 1_000_000.5 }));
+    expect(w.source).toBe('unavailable');
+    expect(w.issues).toEqual([expect.objectContaining({ code: 'invalid_amount', severity: 'high' })]);
+    expect(validateEarnedWithholding(line({ incomeTax: 74_350.5 }))).toEqual([expect.objectContaining({ code: 'invalid_amount' })]);
+    expect(checkLineWithholding(line({ incomeType: 'daily', taxablePay: 10.5, grossPay: 10.5, workDays: 1 })).map((i) => i.code)).toEqual(['invalid_amount']);
+  });
+  it('일용 행 계산 근거에 "매일 같은 일당" 가정 명시', () => {
+    const w = computeLineWithholding(line({ incomeType: 'daily', taxablePay: 1_000_000, workDays: 5 }));
+    expect(w.basis.join(' ')).toContain('같은 일당');
+  });
+});
+
+describe('리뷰 보완 — 근로소득 0원 세액 누락 검출', () => {
+  it('급여 1,000,000 → 5,000,000 인데 소득세 0 → 0: earned_tax_zero(warning)', () => {
+    const prev = line({ taxablePay: 1_000_000, incomeTax: 0, localIncomeTax: 0 });
+    const curr = line({ taxablePay: 5_000_000, incomeTax: 0, localIncomeTax: 0 });
+    const issues = validateEarnedWithholding(curr, prev);
+    expect(issues).toEqual([expect.objectContaining({ code: 'earned_tax_zero', severity: 'warning' })]);
+    expect(issues[0]!.message).toContain(ROUGH_ESTIMATE_LABEL);
+    expect(issues[0]!.message).toContain('부양가족 1명 기준');
+  });
+  it('신규입사자(전월 없음) 소득세 0원도 검출, 저급여·다부양은 오탐하지 않음', () => {
+    expect(validateEarnedWithholding(line({ taxablePay: 3_000_000, incomeTax: 0, localIncomeTax: 0 })).map((i) => i.code)).toEqual(['earned_tax_zero']);
+    expect(validateEarnedWithholding(line({ taxablePay: 950_000, incomeTax: 0, localIncomeTax: 0 }))).toEqual([]);
+    expect(validateEarnedWithholding(line({ taxablePay: 1_500_000, incomeTax: 0, localIncomeTax: 0 }), null, { dependents: 4 })).toEqual([]);
+  });
+  it('earned_tax_zero 가 있으면 rough_estimate_gap(info) 중복 없음', () => {
+    const issues = validateEarnedWithholding(line({ taxablePay: 3_000_000, incomeTax: 0, localIncomeTax: 0 }), null, { useRoughEstimate: true });
+    expect(issues.map((i) => i.code)).toEqual(['earned_tax_zero']);
+  });
+  it('earnedZeroTaxIssue: 근로소득 외·세액 있음·과세 0 은 대상 아님', () => {
+    expect(earnedZeroTaxIssue({ incomeType: 'business', taxablePay: 5_000_000, incomeTax: 0 })).toBeNull();
+    expect(earnedZeroTaxIssue({ incomeType: 'earned', taxablePay: 5_000_000, incomeTax: 10 })).toBeNull();
+    expect(earnedZeroTaxIssue({ incomeType: 'earned', taxablePay: 0, incomeTax: 0 })).toBeNull();
+  });
+});
+
+describe('법정 파라미터 보호', () => {
+  it('WITHHOLDING_PARAMS 는 동결 — 실수로 세율을 바꾸면 오류, 변경은 override 로만', () => {
+    expect(Object.isFrozen(WITHHOLDING_PARAMS)).toBe(true);
+    expect(Object.isFrozen(WITHHOLDING_PARAMS.daily)).toBe(true);
+    expect(Object.isFrozen(WITHHOLDING_PARAMS.earned.rough.brackets[0])).toBe(true);
+    expect(() => {
+      (WITHHOLDING_PARAMS.business as { incomeTaxRate: number }).incomeTaxRate = 0.05;
+    }).toThrow(TypeError);
+    expect(computeBusinessWithholding(1_000_000).incomeTax).toBe(30_000);
+    expect(computeBusinessWithholding(1_000_000, { params: { business: { incomeTaxRate: 0.05 } } }).incomeTax).toBe(50_000);
   });
 });

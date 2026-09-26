@@ -315,3 +315,64 @@ describe('formatDiffSummary', () => {
     expect(r.period).toBeNull();
   });
 });
+
+describe('diffPayroll — 리뷰 보완', () => {
+  it('이번달 한 직원 행에 소득구분 혼재 → income_type_changed(high), 검토 대상', () => {
+    const employees = [emp('01')];
+    const r = diffPayroll(
+      { employees, lines: [pl('01', 1_000_000, PREV_DATE)] },
+      { employees, lines: [pl('01', 700_000), pl('01', 300_000, { incomeType: 'business' })] },
+      { period: '2026-09' },
+    );
+    const c = r.changes[0]!;
+    expect(c.kinds).toEqual(['income_type_changed']);
+    expect(c.severity).toBe('high');
+    expect(c.needsReview).toBe(true);
+    expect(c.messages.join(' ')).toContain('소득구분 혼재(근로소득·사업소득)');
+  });
+  it('직원 마스터 소득구분과 지급행 불일치 → income_type_changed', () => {
+    const employees = [emp('01', { incomeType: 'business' })];
+    const r = diffPayroll({ employees, lines: [] }, { employees, lines: [pl('01', 1_000_000)] }, { period: '2026-09' });
+    expect(r.changes[0]!.kinds).toEqual(['income_type_changed', 'new_hire']);
+    expect(r.changes[0]!.messages[0]).toBe('직원 마스터 소득구분(사업소득)과 지급내역(근로소득) 불일치');
+  });
+  it('음수 지급액 → zero_pay + 환수 확인 메시지', () => {
+    const employees = [emp('01')];
+    const r = diffPayroll({ employees, lines: [pl('01', 3_000_000, PREV_DATE)] }, { employees, lines: [pl('01', -100_000)] }, { period: '2026-09' });
+    expect(r.changes[0]!.kinds).toContain('zero_pay');
+    expect(r.changes[0]!.messages).toContain('지급액 음수(-100,000원) — 환수/정정 내역 확인');
+  });
+  it('잘못된 임계치 설정은 오류 (전원 급변 판정 방지)', () => {
+    const d = { employees: [], lines: [] };
+    expect(() => diffPayroll(d, d, { largeChangePct: -5 })).toThrow('임계치');
+    expect(() => diffPayroll(d, d, { largeChangePct: Number.NaN })).toThrow('임계치');
+    expect(() => diffPayroll(d, d, { largeChangePct: 0 })).not.toThrow();
+  });
+  it('입사일 이전 지급 → 입사일 확인 메시지', () => {
+    const employees = [emp('01', { hireDate: '2026-10-05' })];
+    const r = diffPayroll({ employees, lines: [] }, { employees, lines: [pl('01', 1_000_000)] }, { period: '2026-09' });
+    expect(r.changes[0]!.messages[0]).toBe('입사일(2026-10-05) 이전 지급 — 입사일·귀속월 확인');
+  });
+  it('일용직: 일당 동일하나 과세/비과세 구성 변경 → pay_changed', () => {
+    const employees = [emp('D1', { incomeType: 'daily' })];
+    const r = diffPayroll(
+      { employees, lines: [pl('D1', 200_000 * 10, { ...PREV_DATE, incomeType: 'daily', workDays: 10 })] },
+      { employees, lines: [pl('D1', 200_000 * 5, { incomeType: 'daily', workDays: 5, nonTaxablePay: 50_000 })] },
+      { period: '2026-09' },
+    );
+    expect(r.changes[0]!.kinds).toEqual(['pay_changed']);
+    expect(r.changes[0]!.messages.join(' ')).toContain('과세/비과세 구성 변경');
+  });
+  it('성능: 10,000명 diff 가 선형 시간 (1% 변경 → 검토 100명)', () => {
+    const n = 10_000;
+    const all = Array.from({ length: n }, (_, i) => `E${i}`);
+    const employees = all.map((id) => emp(id));
+    const prevLines = all.map((id) => pl(id, 3_000_000, PREV_DATE));
+    const currLines = all.map((id, i) => (i % 100 === 0 ? pl(id, 3_300_000) : pl(id, 3_000_000)));
+    const t0 = performance.now();
+    const r = diffPayroll({ employees, lines: prevLines }, { employees, lines: currLines }, { period: '2026-09' });
+    const ms = performance.now() - t0;
+    expect(r.summary).toMatchObject({ total: n, unchanged: n - 100, payChanged: 100, needsReview: 100 });
+    expect(ms).toBeLessThan(3_000);
+  });
+});

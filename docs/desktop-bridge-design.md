@@ -2,7 +2,8 @@
 
 - 문서 상태: v1 (2026-09-26)
 - 구현
-  - 현재: `apps/bridge` Node CLI 프로토타입 (`pnpm --filter @mintax/bridge start`, 의존성은 `@mintax/core`만)
+  - 현재(2026-09-26): **미착수**. `apps/bridge`에는 `package.json`·`tsconfig.json`만 있고, 서버 `/api/bridge/*`도 없다. 아래 §11이 첫 구현 범위다.
+  - 다음: `apps/bridge` Node CLI 프로토타입 (`pnpm --filter @mintax/bridge start`, 의존성은 `@mintax/core`만)
   - 목표: Tauri 앱 (Phase 4)
 - 관련 문서: [integration-architecture](./integration-architecture.md) (Adapter C·E), [03-architecture §10 보안](./03-architecture.md#10-보안-아키텍처), [06-mvp-plan](./06-mvp-plan.md)
 - 서버 API(`/api/bridge/*`)는 이 문서가 **제안하는 계약**이다. `apps/web` Route Handler 구현이 확정되면 그쪽이 기준이다.
@@ -250,8 +251,12 @@ stateDiagram-v2
 | `X-MTO-Signature` | 아래 정규 문자열 서명(base64url) |
 
 ```
-정규 문자열 = METHOD + "\n" + PATH(쿼리 포함) + "\n" + TIMESTAMP + "\n" + NONCE + "\n" + CONTENT_SHA256
+정규 문자열 = "MTO1" + "\n" + SIG_ALG + "\n" + DEVICE_ID + "\n" + METHOD + "\n" + PATH(쿼리 포함)
+            + "\n" + TIMESTAMP + "\n" + NONCE + "\n" + CONTENT_SHA256 + "\n" + IDEMPOTENCY_KEY(없으면 빈 문자열)
 ```
+
+- 기기 ID·알고리즘·멱등키까지 서명에 넣는다. 서명을 가로챈 사람이 헤더만 바꿔(다른 기기 ID, 다른 멱등키) 재사용하지 못하게 하기 위해서다. 버전 접두사 `MTO1`은 나중에 형식을 바꿀 때 구분하는 용도다.
+- **알고리즘은 서버가 정한다.** 서버는 기기에 등록된 알고리즘만 받는다. `X-MTO-Sig-Alg`는 확인용일 뿐이다(다운그레이드 방지). 운영 환경(`NODE_ENV=production`)에서는 `hmac-sha256`을 거부한다. 명시적 시험 플래그가 있을 때만 예외다.
 
 서버 검증 순서:
 
@@ -264,7 +269,7 @@ stateDiagram-v2
 
 | 단계 | 방식 | 서버 보관 | 비고 |
 |---|---|---|---|
-| 프로토타입 (Phase 2) | HMAC-SHA256, 사무소 공용 비밀 `BRIDGE_SHARED_SECRET` | 환경변수 | 기기 구분·개별 폐기 불가 → 사내 시험용만 |
+| 프로토타입 (Phase 2) | HMAC-SHA256, 사무소 공용 비밀 `BRIDGE_SHARED_SECRET` | 환경변수 | 기기 구분·개별 폐기 불가 → 사내 시험용만. 페어링이 없어 "연결된 사용자"가 없다. 그래서 서버 설정으로 지정한 **사용자 1명**(제안: `BRIDGE_ACTING_USER_EMAIL`, 기본 권한 staff)의 권한으로만 처리한다. 지정하지 않았으면 `/api/bridge/*`는 503 "Bridge가 설정되지 않았습니다"로 응답한다. 감사로그 행위자는 "사용자명 (Bridge: 공용 비밀)"이다 |
 | 운영 (Phase 4) | **기기별 Ed25519 키쌍**. 개인키는 PC 키체인, 서버는 **공개키만** 보관 | 기기 레지스트리 | 서버 DB가 유출되어도 기기 자격이 새지 않는다. 개별 폐기 가능 |
 
 - 기기 레지스트리는 전용 테이블이 아직 없다([03 §14 G3](./03-architecture.md#14-알려진-계약상-공백-계약-소유자-결정-필요)). 임시로 `integration_connections(key='desktop_bridge').config`(공개키는 비밀이 아님)에 두고, 운영 전 `bridge_devices`를 추가한다.
@@ -312,7 +317,7 @@ sequenceDiagram
     W-->>B: {outboxCount: 1, minVersion, profilesVersion}
   end
   B->>W: GET /outbox
-  W-->>B: [{exportJobId, client, period, kind, version, sha256, mock:false}]
+  W-->>B: [{exportJobId, client, period, kind, version, sha256, mock:false, verified:false, supersededBy:null}]
   B->>W: GET /outbox/{id}/file
   W->>S: 다운로드 기록 (downloaded, 감사 export.download)
   W-->>B: 파일 스트림
@@ -321,7 +326,9 @@ sequenceDiagram
 ```
 
 - 받는 대상: 연결된 사용자가 접근할 수 있는 수임처의 `ready` 파일이다. 같은 사용자의 다른 기기가 이미 받은 파일은 목록에 "받음"으로 표시하고, 다시 받기는 수동으로만 한다.
-- `mock:true` 파일은 파일명 앞에 `MOCK_`을 붙여 저장하고 경고 알림을 띄운다.
+- `mock:true` 파일은 파일명 앞에 `MOCK_`을 붙여 저장하고 경고 알림을 띄운다. 검증되지 않은 표준 서식(`verified:false`)은 파일명 뒤에 `_검증필요`를 붙인다.
+- Bridge가 받은 것도 사람이 받은 것과 같게 `downloaded`로 기록된다. 그 뒤의 정정은 [03 §8.3](./03-architecture.md#83-전송-버전과-정정-전송-이중-기장-방지) 정정 전송 절차를 따른다.
+- **무효 버전 정리**: 서버가 어떤 버전을 새 버전으로 대체했다고 알리면(outbox 응답의 `supersededBy`), Bridge는 로컬 파일을 `04_WEHAGO_업로드용/{수임처}/_무효/`로 옮긴다. 옛 파일을 WEHAGO에 올리는 실수를 막기 위해서다.
 - "업로드 완료 확인"은 Bridge가 대신하지 않는다. WEHAGO 업로드를 사람이 확인해야 하기 때문이다. 알림의 [웹에서 확인] 링크로 연결만 한다.
 
 ---
@@ -462,14 +469,15 @@ sequenceDiagram
 
 - 매직바이트 판별: 테스트 안에서 바이트 픽스처 생성(xlsx·zip·xls·pdf·html·csv)
 - 임시파일 무시 패턴, 안정 판정(가짜 타이머)
-- 서명 정규 문자열과 HMAC 값(고정 벡터)
+- 서명 정규 문자열과 HMAC 값(고정 벡터). 기기 ID·멱등키를 바꾸면 서명이 달라지는지 확인
 - 충돌 없는 이름 생성, 상태 파일 멱등(같은 sha256 두 번 → 한 번만 대기열)
 - 서버 오류 코드 → 폴더 이동 결정 표
 - 로그 스크럽(6자리 이상 숫자 마스킹, 행 데이터 미기록)
 
 ### 11.6 서버 측 준비물 (apps/web · packages/server 담당)
 
-- `/api/bridge/*` Route Handler와 서명 검증 미들웨어
+- `/api/bridge/*` Route Handler와 서명 검증 미들웨어(정규 문자열 `MTO1`, 기기별 알고리즘 고정, 운영 환경 HMAC 거부)
+- 프로토타입 대행 사용자 설정(`BRIDGE_ACTING_USER_EMAIL`, 제안 — `.env.example`에는 아직 없음). 없으면 503
 - 업로드 → `createImport` 연결(`channel` 결정 규칙 §4.3)
 - outbox 조회·다운로드 감사
 - 기기·페어링 코드 저장(임시로 `integration_connections`)

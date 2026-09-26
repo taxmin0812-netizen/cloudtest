@@ -280,8 +280,8 @@ async function readXlsxStreaming(buffer: Buffer, maxRows: number): Promise<Tabul
       if (++count > maxRows) throw tooManyRows(count, maxRows);
       rows[row.number - 1] = rowToArray(row.values);
     }
-    const meta = wsReader as unknown as { name?: string; id?: number };
-    sheets.push({ name: meta.name ?? `Sheet${meta.id ?? idx}`, rows: fillHoles(rows) });
+    const meta = wsReader as unknown as { name?: string; id?: number; state?: string };
+    sheets.push({ name: meta.name ?? `Sheet${meta.id ?? idx}`, rows: fillHoles(rows), hidden: meta.state !== undefined && meta.state !== 'visible' });
   }
   return sheets;
 }
@@ -293,8 +293,11 @@ const ENTITIES: Record<string, string> = { nbsp: ' ', amp: '&', lt: '<', gt: '>'
 function decodeEntities(s: string): string {
   return s.replace(/&(#x[0-9a-f]+|#\d+|[a-z]+);/gi, (m, e: string) => {
     const lower = e.toLowerCase();
-    if (lower.startsWith('#x')) return String.fromCodePoint(parseInt(lower.slice(2), 16));
-    if (lower.startsWith('#')) return String.fromCodePoint(parseInt(lower.slice(1), 10));
+    if (lower.startsWith('#')) {
+      const cp = lower.startsWith('#x') ? parseInt(lower.slice(2), 16) : parseInt(lower.slice(1), 10);
+      // 잘못된 코드포인트(범위 밖·서로게이트)는 원문 유지 — RangeError 로 읽기 전체가 실패하지 않게
+      return Number.isInteger(cp) && cp > 0 && cp <= 0x10ffff && (cp < 0xd800 || cp > 0xdfff) ? String.fromCodePoint(cp) : m;
+    }
     return ENTITIES[lower] ?? m;
   });
 }

@@ -193,7 +193,7 @@ interface IngestAdapter {
 | `hometax_card_purchase_v1` (사업용카드 매입세액 공제 확인/변경) | [커뮤니티] 14열 | 앵커 `승인일자 + 가맹점사업자번호 + 공제여부결정`. 금액 검산 `합계 = 공급가액 + 세액 + 비과세`는 관찰 예시에 근거한 **추론**이므로 불일치를 경고만 한다. `공제여부결정`·`비고` → `sourceDeductibleHint`와 `raw_data`. **승인번호 열이 없다** → 아래 "카드 동일 거래" 규칙 |
 | `hometax_cash_receipt_purchase_v1` (현금영수증 매입) | [커뮤니티] 크롤링 필드명만. 브라우저 엑셀 파일과 같은지는 미확인. 매출내역 다운로드는 **탭 구분 텍스트**라는 관찰이 있다 | 헤더명 동의어 사전(`매입금액↔합계↔총금액`, `부가세↔세액`). `공급가액 + 부가세 + 봉사료`는 관찰된 **대체 계산식**일 뿐 검증식이 아니다. 매입금액이 비었을 때만 쓰고, 불일치는 경고만 한다. 승인·취소(`거래구분`)는 부호로 처리 |
 | `wemembers_*` (통합자료) | **미확인** (research/02 U2) | 샘플을 받기 전에는 `mock` 상태. 합계 수준 자료일 수 있다(U3). 그 경우 거래 적재가 아니라 **대사 기준값**으로만 쓴다 |
-| `wehago_ledger_purchase_sales_v1` (매입매출장 엑셀 변환, 역수입) | [공식] 변환 항목: 일자, 거래처, 유형, 품명, 공급가액, 부가세, 합계, 차변계정, 대변계정, 관리, 전표상태 | 실제 헤더 원문과 사업자번호 포함 여부는 **샘플 필요**. 사업자번호가 없으면 대사 키를 `일자 + 정규화 거래처명 + 금액 + 유형`으로 낮춘다(검증필요) |
+| `wehago_ledger_purchase_sales_v1` (매입매출장 엑셀 변환, 역수입) | [공식] 변환 항목: 일자, 거래처, 유형, 품명, 공급가액, 부가세, 합계, 차변계정, 대변계정, 관리, 전표상태 | 실제 헤더 원문과 사업자번호 포함 여부는 **샘플 필요**. 현재 core 대사 키는 `일자 + 합계 + 정규화 거래처명`(2차 `일자 + 합계`)이다. 사업자번호가 있으면 `일자 + 사업자번호 + 금액 + 과세유형`으로 올린다(§6.2, 검증필요) |
 
 **카드 동일 거래 규칙** (승인번호가 없는 원천)
 
@@ -217,7 +217,7 @@ interface IngestAdapter {
 | 동작 | 새 파일 → 다운로드 중 임시파일(`.crdownload`, `.part`, `.download`, `.tmp`, `~$` 잠금파일)은 무시 → 크기가 2초 이상 변하지 않으면 "안정" → 매직바이트·헤더 스니핑 → **등록된 프로파일과 맞는 파일만** 업로드 |
 | 개인정보 | 프로파일과 맞지 않는 파일은 내용도 이름도 서버로 보내지 않는다. 로컬 로그에는 "무시함(형식 불일치)"만 남긴다 |
 | 원본 처리 | 다운로드 폴더는 사용자 공간이므로 **기본은 원본 유지**다. 이미 올린 파일은 로컬 기록(sha256)으로 다시 올리지 않는다. 설정으로 "업로드 후 정리 폴더로 이동"을 켤 수 있다 |
-| 상태 | Bridge 연결 시 **FILE_BASED** |
+| 상태 | Bridge 연결 시 **FILE_BASED**. 2026-09-26 현재 Bridge 미구현이므로 사용할 수 없다 |
 
 ### 4.4 Adapter D — 클라우드 폴더 감시 (`cloud_folder`)
 
@@ -235,7 +235,7 @@ interface IngestAdapter {
 |---|---|
 | 역할 | 사무소 PC의 **Bridge 전용 폴더**(수신 대기·WEHAGO 업로드용·신고결과)를 관리한다. 서명 토큰으로 `/api/bridge/*`에 업로드하고, 준비된 WEHAGO 파일을 받아 둔다 |
 | 원본 처리 | Bridge 전용 수신 폴더의 파일은 서버 확인(ack) 후 **처리완료 폴더로 이동**한다(기본) |
-| 상태 | Node CLI 프로토타입 → Tauri 앱. 연결되면 **FILE_BASED** |
+| 상태 | **미구현**(설계 완료). Node CLI 프로토타입 → Tauri 앱 순서로 만든다. 연결되면 **FILE_BASED** |
 | 상세 | [desktop-bridge-design](./desktop-bridge-design.md) |
 
 ---
@@ -277,6 +277,10 @@ flowchart LR
 **템플릿 레지스트리** (`packages/adapters`)
 
 - 식별: `template_key` + `template_version`(서식을 내려받은 날짜 `YYYYMMDD`)
+- 서식 상태(`status` + `verified`, 2026-09-26 코드 기준)
+  - `mock`: 열 구성을 모르는 개발용이다. 급여·사업소득·일용직이 해당한다. `MOCK_` 파일명이고 업로드 완료 확인을 막는다.
+  - `standard`(`verified=false`): MIN TAX OPS 표준 레이아웃이다. 매입매출·일반전표가 해당한다. "검증필요 서식" 경고를 붙이고, 역수입 대사 전에는 대사완료로 보지 않는다.
+  - `office_sample`(`verified=true`): 사무소가 WEHAGO에서 내려받은 실서식이다. 첫 업로드 성공이 기록되어야 한다.
 - 제목행 해시: 등록할 때 저장하고, 생성할 때 다시 비교한다. 다르면 차단한다.
 - **코드 매핑은 데이터로 둔다**(research/01 §2.5·2.6 [공식, 스니펫] 수준, 실서식으로 확정).
 
@@ -303,10 +307,12 @@ flowchart LR
 
 ### 6.2 WEHAGO — 역수입 대사
 
-사람이 WEHAGO 매입매출장을 엑셀로 변환해 올리거나 Bridge로 넘긴다. 그러면 `post_export` 대사가 돈다. 키는 WEHAGO 중복전표 기준과 같게 **일자 + 사업자번호 + 금액 + 과세유형**을 쓴다(research/01 §2.9 [공식]).
+사람이 WEHAGO 매입매출장을 엑셀로 변환해 올리거나 Bridge로 넘긴다. 그러면 `post_export` 대사가 돈다.
 
-- 이 기준은 WEHAGO(Smart A 10) 도움말에서 확인한 것이다. WEHAGO T에도 같은지는 추론이므로 파일럿에서 확인한다.
-- 사업자번호가 없는 변환 파일이면 §4.2 규칙대로 키를 낮춘다.
+- **현재 매칭 키(core `reconcile` 구현)**: 1차 **일자 + 합계 + 정규화 상호**, 2차 **일자 + 합계**다. 역수입 행 계약(`ReconWehagoRow`)에 사업자번호가 없다.
+- **목표 키**: WEHAGO 중복전표 기준과 같은 **일자 + 사업자번호 + 금액 + 과세유형**(research/01 §2.9 [공식])이다. 매입매출장 변환 샘플에 사업자번호 열이 있는지 확인한 뒤 core 계약을 넓힌다.
+  - 이 기준은 WEHAGO(Smart A 10) 도움말에서 확인한 것이다. WEHAGO T에도 같은지는 추론이므로 파일럿에서 확인한다.
+- 같은 전표가 WEHAGO에 두 번 있으면(이전 버전과 새 버전을 모두 올린 경우) 현재 core는 `extra_in_wehago`(비차단)로만 표시한다. 이중 기장 의심으로 차단하도록 보완한다([03 §8.3](./03-architecture.md#83-전송-버전과-정정-전송-이중-기장-방지), §14 G8).
 
 ### 6.3 홈택스·위택스 신고와 결과 수집
 
@@ -326,26 +332,29 @@ flowchart LR
 | 키 | 상태 | 근거 (`status_reason`) | 재평가 조건 |
 |---|---|---|---|
 | `wemembers.api` | **NOT_AVAILABLE** | 공개·제휴 API 미확인 (research/02 I3·U1) | 웹케시 서면 회신 |
-| `wemembers.file` | **MOCK → FILE_BASED** | 통합자료 엑셀 다운로드 기능은 [공식(검색 요약)], 열 구성 미확인 (D1·U2) | 사무소 실계정 샘플 등록 |
+| `wemembers.file` | **FILE_BASED** (위멤버스 고유 프로파일은 MOCK) | 통합자료 엑셀 다운로드 기능은 [공식(검색 요약)], 열 구성 미확인 (D1·U2). 지금은 홈택스 원본 레이아웃과 같은 파일만 판별된다. 위멤버스 고유 서식은 "알 수 없는 서식"으로 격리된다 | 사무소 실계정 샘플 등록 |
 | `wemembers.filing_zip` | **FILE_BASED** (파일명 규칙 미확인) | 신고리스트 개별·일괄 다운로드 (D3·D4) | 샘플 ZIP으로 매칭 검증 |
 | `hometax.file` | **FILE_BASED** | 원본 엑셀 3종 레이아웃 [커뮤니티] 관찰. 전자세금계산서 열 순서는 1건 근거 (research/02 §2.5) | 실제 샘플로 지문 확정 |
 | `hometax.scrape` | **NOT_AVAILABLE (정책상 배제)** | 2026-08-20 시행 개인정보 보호법 시행령: 대리인의 자동화 도구 전송요구는 "사전에 협의한 방식"이어야 한다(제42조의6③1나 [법령 미러]). 홈택스·세무대리 수집에 적용되는지는 미확인이므로 보수적으로 배제. 국세청 오픈 API 설계 진행 중 (research/02 R1~R4) | 국세청 공식 오픈 API 공개 |
 | `wehago.voucher_api` | **NOT_AVAILABLE** | 공개 전표 API 미확인, `developer.wehago.com` 접속 불가 (research/01 U1) | 더존 서면 회신 |
-| `wehago.purchase_sales_file` | **MOCK → FILE_BASED** | 엑셀서식 내려받기/불러오기 [공식], 열 미확인 (U2) | 실서식 등록 |
-| `wehago.general_journal_file` | **FILE_BASED** | 지정 양식 없음 + 필수 7항목 매칭 [공식] | 실제 업로드 1회 성공 기록 |
-| `wehago.payroll_file` | **MOCK → FILE_BASED** | 서식 기능 [공식], 열 미확인 (U7) | 실서식 등록 |
+| `wehago.purchase_sales_file` | **FILE_BASED** (검증필요 표준 서식, `verified=false`) | 엑셀서식 내려받기/불러오기 [공식], 열 미확인 (U2). WEHAGO 실서식으로 올라간다는 보장이 없다 | 실서식 등록 + 첫 업로드 성공 |
+| `wehago.general_journal_file` | **FILE_BASED** (검증필요 표준 서식, `verified=false`) | 지정 양식 없음 + 필수 7항목 매칭 [공식] | 실제 업로드 1회 성공 기록 |
+| `wehago.payroll_file` | **MOCK** | 서식 기능 [공식], 열 미확인 (U7). 업로드 금지 | 실서식 등록 |
 | `wehago.ledger_reimport` | **FILE_BASED** (헤더 샘플 필요) | 매입매출장 엑셀 변환 [공식] | 샘플 등록 |
 | `wehago.master_file` | **FILE_BASED** | 거래처 가져오기(지정 양식), 계정과목 수임처별 가변 [공식] | 수임처 온보딩 |
 | `wetax.file` | **FILE_BASED** (위멤버스 경유) | 위택스 납부서는 위멤버스가 일괄 수집 (D5) | — |
 | `hometax.efiling` (원천세·간이지급명세서·지급명세서 제출) | **FILE_BASED** (API는 NOT_AVAILABLE) | 「홈택스 이용에 관한 규정」 제12조: 전자신고는 작성·**변환**·확인 방식뿐이고 API 방식 규정이 없다 (research/03 A1). WEHAGO가 파일을 만들고 사람이 변환신고·변환제출 | 국세청 제출 API 공개 |
 | `wetax.local_tax_filing` (지방소득세 특별징수 신고) | **FILE_BASED** (사람) | 위택스 한건신고 / 엑셀파일신고 / 회계파일신고 (research/03 §1.4) | — |
-| `download_watch` | **FILE_BASED** (Bridge 연결 시) | 자체 구현 | — |
+| `download_watch` | **미구현** → 목표 FILE_BASED | Bridge가 없어 동작하지 않는다(아래 주의) | Bridge 프로토타입 + `/api/bridge/*` 구현 |
 | `cloud_folder` | **NOT_AVAILABLE** (미설정) | 저장소 미설정 | 저장소 설정 |
-| `desktop_bridge` | **FILE_BASED** (프로토타입) | 자체 구현 | Tauri 배포 |
+| `desktop_bridge` | **미구현** → 목표 FILE_BASED | `apps/bridge`에는 `package.json`만 있고, `/api/bridge/*` Route Handler도 없다 | 프로토타입 + 서명 검증 테스트 통과 |
 | `ai_provider.heuristic` | **LIVE** (내부) | 로컬 규칙, 외부 전송 없음 | — |
 | `ai_provider.anthropic` | 키 설정 시 **LIVE**, 아니면 NOT_AVAILABLE | `AI_PROVIDER=anthropic` + `ANTHROPIC_API_KEY` | 개인정보 검토(06 §5 U11) |
 | `third_party.popbill` / `third_party.codef` | **NOT_AVAILABLE (보류)** | 공식 벤더 API는 있으나, 사전협의 여부·비용·규제 검토 전 (research/02 §2.7) | 비용·규제 검토 후 결정 |
 | RPA 전체 | **없음** | 약관 미확인 (research/02 R8·U10), 인증서 위임 보안 위험 | 서면 허용 |
+
+- **주의 — 코드 레지스트리와의 차이 (2026-09-26)**: `packages/adapters/src/integrations.ts`는 `desktop_bridge`·`download_watch`를 이미 `FILE_BASED`로 둔다. 하지만 Bridge 앱과 `/api/bridge/*`가 없어서 실제로는 동작하지 않는다. "상태를 속이지 않는다"는 원칙에 따라, 구현 전까지 레지스트리 값을 `NOT_AVAILABLE`(사유 "설계 완료·미구현")로 내려야 한다. adapters 담당이 바꿀 항목이다.
+- 설정 화면과 `integration_connections` 초기값은 레지스트리(`getIntegrationStatuses`)에서 만든다. 이 표와 레지스트리가 다르면 **둘 다** 고친다(§10).
 
 ---
 
@@ -360,6 +369,7 @@ WEHAGO T는 자동전표처리로 세금계산서·계산서·카드·현금영�
 | `none` | 해당 원천 없음 | — |
 
 - 저장 위치: `client_business_profiles.rule_params`의 `export_scope.*` 키(계약 변경 없이 쓸 수 있는 임시 위치). 정식 컬럼이 필요하면 계약 소유자와 결정한다.
+- **대사 입력에서도 빼야 한다.** `wehago_collects` 원천의 원본 행·거래를 전송 대사(`pre_export`·`post_export`)에 넣으면 "전송 합계 ≠ 승인 거래 합계"가 되어 **항상 차단**된다. 이 원천은 원본 ↔ WEHAGO 역수입만 비교하는 검증 대사로 따로 돌린다([03 §8.1](./03-architecture.md#81-등식) 대사 범위).
 - 역수입 대사에서 `extra_in_wehago`가 체계적으로 나오면, 전송 범위 설정이 WEHAGO 실제 설정과 어긋났다는 신호다. 알림을 보낸다.
 
 ---

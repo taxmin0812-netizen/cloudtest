@@ -14,8 +14,11 @@
 | 도메인 계약 `packages/core` (types, money, normalize, dsl, fingerprint, policy, hash) | 완료 |
 | DB 스키마 31개 테이블 + 초기 마이그레이션 `0000_init.sql` | 완료 |
 | 웹 디자인 토큰 (`tailwind.config.ts`, `globals.css`) | 완료 |
-| adapters · security · ai · server · worker · bridge · seed 구현 | 병렬 진행 중 |
-| 외부 조사: WEHAGO(research/01), 위멤버스(research/02) | 완료 (원문 미열람 항목은 검증필요) |
+| adapters · security · ai · seed 구현, core 엔진(분류·부가세·위험·대사·인건비) | 병렬 진행 중 |
+| server | 일부: Job Queue(`jobs/queue.ts`), 감사로그 도우미, 컨텍스트. 가져오기·전송·대사 서비스는 미구현 |
+| worker | 루프·재시도·회수 구현. 하트비트·회수 상한은 필수 보완([03 §9.2](./03-architecture.md#92-획득실행재시도)) |
+| bridge (`apps/bridge`) | **미착수** — `package.json`만 있다. `/api/bridge/*`도 없다 |
+| 외부 조사: WEHAGO(research/01), 위멤버스(research/02), 홈택스·위택스 신고(research/03), 부가세·계정(research/04) | 완료 (원문 미열람 항목은 검증필요) |
 
 ---
 
@@ -71,7 +74,7 @@ flowchart LR
 | 가져오기 | `files`(sha256, 암호화 저장) → `import_jobs` → `transaction_sources`(모든 행) → 정규화 → fingerprint → 중복 → `transactions`. 수임처 단위 advisory lock |
 | 엔진 (`core`, 순수) | 계정 Level 1~8, 부가세 엔진, 위험 엔진(`review_rules` kind 8종), 정책(`reviewLevelFor`) |
 | AI | 휴리스틱 Provider(외부 전송 없음), 신뢰도 상한 85 |
-| Job Queue | `jobs` 획득(`SKIP LOCKED`)·재시도·리퍼·진행률 |
+| Job Queue | `jobs` 획득(`SKIP LOCKED`)·재시도·리퍼·진행률. **하트비트(`locked_at` 갱신)와 회수 상한(`max_attempts`)** 보완 |
 | 보안 기초 | 로그인(scrypt, 잠금), 세션(해시, 유휴/절대 만료), RBAC 권한표, 감사로그 기록 도우미 |
 | 시드 | 합성 수임처 5곳 × 6개월 이력, 기본 규칙(`system_default`), **골든셋 v1**(거래 1,000건 이상, 정답 계정·부가세·버킷) |
 
@@ -83,6 +86,7 @@ flowchart LR
   - 원본 행 수 = `transaction_sources` 행 수 (유실 0)
 - 같은 파일을 두 번 넣어도 거래가 늘지 않는다(파일 sha256). 같은 거래가 다른 채널로 들어오면 중복으로 보관된다(fingerprint).
 - 500행 파일의 가져오기 + 분류가 개발 PC에서 30초 안에 끝난다(참고 지표).
+- 회수 시간(기본 15분)보다 오래 걸리는 작업이 다른 워커에서 **중복 실행되지 않는다**(하트비트 테스트). 워커를 매번 죽이는 작업은 `max_attempts` 후 `failed`로 끝난다.
 
 ### Phase 2 — 검토·학습·전송·대사 (시나리오 1)
 
@@ -93,7 +97,7 @@ flowchart LR
 | 학습 | `classification_corrections` 기록, 동일 수정 3회 → 규칙 제안, 알림 `rule_suggested` |
 | Rule Studio | DSL 편집기, 읽기 문장, 검증, 백테스트(최근 3개월), 승인 권한 |
 | 대사 | `pre_export` 등식(4개 차원 × 전체·증빙별·계정별), 차이 분류, 전송 차단 |
-| WEHAGO | 매입매출·일반전표 템플릿 레지스트리(`template_key/version`, 제목행 해시), **실서식을 받기 전에는 MOCK**, 파일 재읽기 검증 |
+| WEHAGO | 매입매출·일반전표 템플릿 레지스트리(`template_key/version`, 제목행 해시), **실서식을 받기 전에는 검증필요 표준 서식**(`standard`, `verified=false`), 파일 재읽기 검증 |
 | 전송센터 | 파이프라인 7단계, 행별 다음 행동, 다운로드 감사, 업로드 완료 확인 |
 | 대시보드·알림·KPI | 버킷 집계, 문제 알림 6종(자동 해소), `kpi_snapshot` |
 | 병행 | Bridge Node CLI 프로토타입(업로드 경로·서명 검증) |
@@ -125,7 +129,7 @@ flowchart LR
 |---|---|
 | Desktop Bridge | Tauri 패키징, 폴더 감시, 형식 스니핑(서버 프로파일), 서명 업로드, 결과 파일 받기, 폴더 이동, 로컬 로그, OS 키체인, 자동 업데이트, 코드 서명 |
 | 채널 | 다운로드 폴더 감지(C), 클라우드 폴더(D: S3 호환 prefix / SFTP·NAS) |
-| 역수입 대사 | WEHAGO 매입매출장 엑셀 → `post_export` 대사(일자 + 사업자번호 + 금액 + 과세유형) |
+| 역수입 대사 | WEHAGO 매입매출장 엑셀 → `post_export` 대사. 현재 core 매칭 키는 일자 + 합계 + 정규화 상호(2차: 일자 + 합계). 매입매출장 샘플에 사업자번호가 있으면 WEHAGO 중복전표 기준(일자 + 사업자번호 + 금액 + 과세유형)으로 올린다 |
 | 신고 결과 | 위멤버스 신고리스트 일괄 ZIP → 접수증·납부서 자동 매칭 |
 | 보안 강화 | 관리자 MFA 필수, 허용 IP, 키 교체 재암호화 작업, Bridge 기기 관리 |
 | AI (선택) | Anthropic Provider(환경변수로 켬), 장부 검토(`ai_reviews`) |
@@ -173,7 +177,7 @@ flowchart LR
 | 입력 파일 | 홈택스 사업용카드 형식(14열) 합성 xlsx, 2026-09, **500행**, 원본 합계 `S`(픽스처에 기록) |
 | 예외 설계 | 30건. 주 버킷: 신규 거래처 10, 저신뢰도 6, 공제/불공제 검토 5, 고액 3, 계정과목 충돌 3, 자산 가능성 2, 해외결제 1 |
 | 수정 설계 | 30건 중 4건은 정답이 추천과 다르다. 그중 3건은 같은 거래처(합성 "쿠팡")이고 정답은 `소모품비 → 사무용품비`다 |
-| WEHAGO 서식 | 매입매출 템플릿(실서식 등록 전에는 MOCK) |
+| WEHAGO 서식 | 매입매출 템플릿(실서식 등록 전에는 검증필요 표준 서식 `standard`/`verified=false`) |
 | 수임처 전송 범위 | "카드 매입을 MIN TAX OPS 파일로 반영"을 켬(이중 기장 방지 설정 — [integration-architecture §8](./integration-architecture.md)) |
 
 #### 3.1.2 실행과 기대 결과 (When / Then)
@@ -184,9 +188,9 @@ flowchart LR
 | 2 | 분류 작업 완료 | `transactions`: `auto_approved` **470**, `needs_review` **30** · 자동확정 470건은 모두 `confidence_score ≥ 95`이고 차단 위험 0 · 예외 30건은 모두 버킷 ≥ 1개 · `classification_results` 500행 · 대시보드 자동처리율 **94.0%** |
 | 3 | 예외 검토: 26건 승인(`A`, `Shift+A`), 4건 수정(`M`) | `approved` 30 · `classification_corrections` **4행**(`field=account`, `before_source`·`before_confidence` 기록) · `touch_count ≥ 1`인 거래 30 |
 | 4 | 학습: 3번째 "쿠팡" 수정 직후 | `mapping_rules` 1행: `status=suggested`, `origin=system_suggested`, `suggestion_reason`에 "동일 수정 3회" · `classification_corrections.suggested_rule_id` 연결 · 알림 `rule_suggested` 1건 |
-| 5 | manager가 Rule Studio에서 백테스트 확인 후 승인 | `status=active`, `approved_by` 기록, 감사 `rule.approve` · **검증용 추가 파일**(2026-10 쿠팡 2건)을 넣으면 2건 모두 `classification_source=user_rule`, `confidence_score=99`, `auto_approved` |
+| 5 | manager가 Rule Studio에서 백테스트 확인 후 승인 | `status=active`, `approved_by` 기록, 감사 `rule.approve` · **검증용 추가 파일**(2026-10 쿠팡 2건)을 넣으면 2건 모두 `classification_source=user_rule`, `account_confidence=99`, `auto_approved`. `confidence_score`는 min(계정, 부가세)이므로 부가세 규칙 값(카드 과세 매입 기본 90~97)에 따라 **≥ 95**만 검증한다 |
 | 6 | 대사 실행 (`pre_export`) | `reconciliation_jobs`: `balanced=true`, `export_allowed=true` · 등식: source 500 / S = export 500 / S + 중복 0 + 제외 0 + 실패 0 + 대기 0 · 4개 차원 모두 차이 0원 · 증빙별·계정별 소계도 균형 |
-| 7 | WEHAGO 파일 생성 | `export_jobs`: `kind=wehago_purchase_sales`, `status=ready`, `row_count=500`, 금액 합계 = S · `export_items` 500행 · 생성 파일을 **다시 읽은** 합계 = S · MOCK 서식이면 파일명 `MOCK_` 접두사와 경고 행 |
+| 7 | WEHAGO 파일 생성 | `export_jobs`: `kind=wehago_purchase_sales`, `status=ready`, `row_count=500`, 금액 합계 = S · `export_items` 500행 · 생성 파일을 **다시 읽은** 합계 = S · 표준 서식이면 "검증필요 서식" 표시와 역수입 대사 필수 표시(`mock` 서식이면 `MOCK_` 접두사·경고 행·업로드 완료 확인 불가) |
 | 8 | 업로드 파일 받기 | `status=downloaded`, `downloaded_at` 기록, 감사 `export.download` · 전송센터 단계 "전송" |
 | 9 | 감사로그 확인 | 아래 표의 로그가 모두 있고, 각 로그에 before/after와 사람이 읽는 요약이 있다 |
 
@@ -216,14 +220,19 @@ flowchart LR
 
 | 변형 | 기대 |
 |---|---|
-| 전송 대상 1건의 부가세를 1원 줄임 | `balanced=false`, `unexplained`(blocking) · `export_jobs.status=blocked` · 문구 "부가세 합계가 원본보다 1원 적습니다. 1원 차이도 전송하지 않습니다." |
+| 전송 대상 1건의 부가세를 1원 줄임 (거래 금액 또는 전송파일 행) | `balanced=false`, `amount_mismatch`(blocking, 해당 거래·차원·차이 1원 명시) · `export_allowed=false` · `export_jobs.status=blocked` · 문구 "부가세 합계가 원본보다 1원 적습니다. 1원 차이도 전송하지 않습니다." |
 | 1건을 검토하지 않고 남김 | `pending_review` blocking · "검토하지 않은 거래가 1건 있어 파일을 만들 수 없습니다. [1건 검토하기]" |
 | 계정코드가 계정표에 없는 거래 3건 | 파일 생성 차단 · "WEHAGO 파일 생성 중 3건의 계정코드를 찾지 못했습니다. [3건 검토하기]" |
 | 같은 파일을 다시 업로드 | 거래 수 변화 없음 · "이미 가져온 파일입니다" |
 | 같은 거래 7건을 다른 채널(Bridge)로 다시 넣음 | 7건이 `duplicate`로 보관(삭제 없음) · 대사에서 `duplicate_excluded`(설명됨)로 균형 유지 |
-| 금액 칸이 깨진 행 2건 | `failed_rows=2`, `partial` · 금액을 알 수 없으면 `parse_failed` blocking |
+| 금액 칸이 깨진 행 2건 | `failed_rows=2`, `partial` · `parse_failed` 2건 **blocking**(core는 금액을 알든 모르든 차단) · `export_allowed=false` · 해소 절차(재수집 대체·확인 후 제외)는 03 §14 G6 계약 보완 후 테스트를 추가한다 |
 | WEHAGO 서식 제목행 해시 불일치 | 파일 생성 차단 · "등록된 서식과 제목줄이 다릅니다" |
 | staff가 규칙 승인 시도 | 403 · "규칙 승인 권한이 필요합니다" · 감사 `security` 로그 |
+| v1을 `uploaded_confirmed`한 뒤 거래 1건을 정정하고 v2 생성 | v2 "업로드 완료 확인"은 "WEHAGO에서 v1 전표를 삭제했습니다" 체크 없이는 거부 · 감사로그에 v1 식별자 기록 (03 §8.3) |
+| v1 `downloaded` 상태에서 그 파일에 든 거래를 `Ctrl+Z`·감사 되돌리기 | 거부 · "이미 WEHAGO용 파일로 받은 거래입니다. [정정 전송]" · 거래 상태 변화 없음 |
+| v1 `ready` 상태에서 포함 거래 1건 수정 | 수정 허용 · v1 `blocked`("포함 거래가 변경되었습니다") · v1 다운로드 거부 |
+| 수임처 전송 범위를 현금영수증 `wehago_collects`로 두고 현금영수증 20건을 함께 수집 | 전송파일에는 카드 500건만 · 전송 대사는 카드 원천만으로 균형 · 현금영수증 20건은 별도 검증 대사 대상(03 §8.1 대사 범위) |
+| 역수입 파일에 같은 전표가 두 번 있음(v1·v2 모두 업로드) | 03 §14 G8 보완 후: 이중 기장 의심 blocking · 보완 전: high 알림 |
 
 ### 3.2 시나리오 2 — 직원 10명 월 급여
 
@@ -276,6 +285,9 @@ flowchart LR
 | `.xls`(BIFF) 입출력 | 일부 파일 처리 불가 | [03 §13.1](./03-architecture.md#131-왜-pythonopenpyxl이-아니라-typescriptexceljs인가) 대응 순서 |
 | 수임처별 계정과목표·거래처코드 테이블 부재(03 §14 G1·G2) | 매입매출 파일 생성 시 코드 누락 | Phase 2 시작 전에 계약 소유자가 결정. 그 전에는 사무소 표준 계정표와 코드 누락 차단으로 운영 |
 | 이중 기장(WEHAGO T 자체 수집과 중복) | 장부 오류 | 수임처별 전송 범위 설정 + 역수입 대사(`extra_in_wehago`) |
+| 이중 업로드(같은 기간 v1·v2를 모두 WEHAGO에 올림) | 장부 이중 계상 | 전송 버전 규칙(03 §8.3) + 이중 기장 의심 차단(03 §14 G8) |
+| 실패 행 해소 방법 없음(03 §14 G6) | 실패 행이 생긴 기간은 전송 불가 | Phase 2 시작 전에 계약 소유자가 `transaction_sources` 해소 컬럼을 결정 |
+| 작업 회수 중 중복 실행(하트비트 미구현) | 원본 행 중복 적재 → 대사 source 부풀림 | Phase 1 DoD의 하트비트·멱등 테스트 |
 | 세법 파라미터 오류 | 세액 오계산 | 연도별 파라미터 테이블 + 출처·확인일 + 세무사 확인 전 검증필요 표시 |
 | 스크래핑 규제(2026-08-20 시행령) | 위멤버스 수집 중단 가능 | 홈택스 원본 수동 업로드 경로를 상시 유지한다(research/02 U11) |
 | 학습 오염(잘못된 수정의 반복) | 자동확정 오류 확산 | 규칙은 사람 승인 필수, 수정 기억만으로는 자동확정 불가(최대 94), 백테스트 |
@@ -297,3 +309,5 @@ flowchart LR
 | U9 | 배포 형태 결정(국내 리전 클라우드 / 사내 서버), 백업 보관 위치 | Phase 4 | 운영 환경 |
 | U10 | Bridge **코드 서명 인증서**(Windows) 구매 결정 | Phase 4 | 설치 경고 방지 |
 | U11 | 개인정보 처리방침·위탁·국외이전(AI 사용 시) 검토 | Phase 4 | AI Provider 활성화 조건 |
+| U12 | **자동확정 문턱 정책 확인**: 같은 거래처(사업자번호)에서 **2번** 일관되게 확정된 이력만 있어도 95점으로 자동확정되는 현재 기본값(03 §5.1)을 허용할지. 더 보수적으로 하려면 3번 이상으로 올린다 | Phase 1 종료 전 | 자동확정 범위·오류 위험 |
+| U13 | **WEHAGO 재업로드 절차 확인**: 같은 달 파일을 다시 올릴 때 WEHAGO에서 이전 전표를 지우는 방법(일괄 삭제 가능 여부)과, 엑셀서식 불러오기에 중복전표 검사가 있는지 | Phase 2 | 정정 전송 절차(03 §8.3) |

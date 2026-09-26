@@ -1,14 +1,36 @@
 import type { AccountCode, CorrectionRecord, Direction, HistoryEntry, LocalDate, UUID, Won } from '../types';
-import { isAccountCompatible } from '../data/accounts';
+import { accountDirection, isAccountCompatible } from '../data/accounts';
 
 /**
  * 과거 처리 이력(HistoryEntry) 인덱스·집계 도우미.
  * 모두 순수 함수이며, 입력 배열 순서와 무관하게 같은 결과를 낸다(결정성).
  */
 
+/**
+ * 계약 타입(HistoryEntry·CorrectionRecord)에는 매입/매출 구분이 없다.
+ * 호출자(서버)가 transactions.direction 을 조인해 넘겨주면 엔진은 이를 엄격히 적용하고,
+ * 없으면 계정 성격으로 추정한다(자산·부채 계정은 추정 불가 → 자동승인 제한).
+ */
+export type DirectedHistoryEntry = HistoryEntry & { direction?: Direction | null };
+export type DirectedCorrectionRecord = CorrectionRecord & { direction?: Direction | null };
+
 // ────────────────────────────── 날짜 ──────────────────────────────
 
 const DAY_MS = 86_400_000;
+
+const OFFSET_RE = /(?:[zZ]|[+-]\d{2}(?::?\d{2})?)$/;
+
+/**
+ * ISO 시각 → epoch ms. 시간대 표기가 없는 시각('2026-09-05T10:00:00', '2026-09-05 10:00:00')과
+ * 날짜만 있는 값은 KST(+09:00)로 해석한다 — 실행 머신의 시간대에 따라 결과가 달라지지 않도록.
+ */
+export function parseInstant(iso: string): number {
+  const s = String(iso ?? '').trim();
+  if (/^\d{4}-\d{2}-\d{2}$/.test(s)) return Date.parse(`${s}T00:00:00+09:00`);
+  const t = s.replace(' ', 'T').replace(/([+-]\d{2})$/, '$1:00');
+  if (/T\d{2}:\d{2}/.test(t) && !OFFSET_RE.test(t)) return Date.parse(`${t}+09:00`);
+  return Date.parse(t);
+}
 
 function dateToUtcMs(date: LocalDate): number {
   const y = Number(date.slice(0, 4));
@@ -27,8 +49,8 @@ export function daysBetween(from: LocalDate, to: LocalDate): number {
 
 /** ISO 시각 → KST 기준 'YYYY-MM-DD' (수정 시각 비교용) */
 export function isoToKstDate(iso: string): LocalDate {
-  const t = Date.parse(iso);
-  if (Number.isNaN(t)) return iso.slice(0, 10);
+  const t = parseInstant(iso);
+  if (Number.isNaN(t)) return String(iso ?? '').slice(0, 10);
   return new Date(t + 9 * 3_600_000).toISOString().slice(0, 10);
 }
 
@@ -61,9 +83,9 @@ export function historyKey(clientId: UUID, merchantRef: string): string {
 
 export interface HistoryIndex {
   /** clientId|b:bizno → 이력 (날짜 오름차순) */
-  byBizno: Map<string, HistoryEntry[]>;
+  byBizno: Map<string, DirectedHistoryEntry[]>;
   /** clientId|k:merchantKey → 이력 (날짜 오름차순) */
-  byKey: Map<string, HistoryEntry[]>;
+  byKey: Map<string, DirectedHistoryEntry[]>;
   size: number;
 }
 
@@ -83,9 +105,9 @@ function pushTo<K, V>(m: Map<K, V[]>, k: K, v: V): void {
 }
 
 /** 거래처별 이력 인덱스 (사업자번호·상호키 각각). 빈 상호키는 색인하지 않는다. */
-export function buildHistoryIndex(entries: readonly HistoryEntry[]): HistoryIndex {
-  const byBizno = new Map<string, HistoryEntry[]>();
-  const byKey = new Map<string, HistoryEntry[]>();
+export function buildHistoryIndex(entries: readonly DirectedHistoryEntry[]): HistoryIndex {
+  const byBizno = new Map<string, DirectedHistoryEntry[]>();
+  const byKey = new Map<string, DirectedHistoryEntry[]>();
   for (const e of entries) {
     if (e.merchantBusinessNumber) pushTo(byBizno, historyKey(e.clientId, biznoKey(e.merchantBusinessNumber)), e);
     if (e.merchantKey) pushTo(byKey, historyKey(e.clientId, merchantNameKey(e.merchantKey)), e);
@@ -97,13 +119,13 @@ export function buildHistoryIndex(entries: readonly HistoryEntry[]): HistoryInde
 
 /** 거래처 구분 없는 상대방 인덱스 (업종 패턴용) */
 export interface MerchantIndex {
-  byBizno: Map<string, HistoryEntry[]>;
-  byKey: Map<string, HistoryEntry[]>;
+  byBizno: Map<string, DirectedHistoryEntry[]>;
+  byKey: Map<string, DirectedHistoryEntry[]>;
 }
 
-export function buildMerchantIndex(entries: readonly HistoryEntry[]): MerchantIndex {
-  const byBizno = new Map<string, HistoryEntry[]>();
-  const byKey = new Map<string, HistoryEntry[]>();
+export function buildMerchantIndex(entries: readonly DirectedHistoryEntry[]): MerchantIndex {
+  const byBizno = new Map<string, DirectedHistoryEntry[]>();
+  const byKey = new Map<string, DirectedHistoryEntry[]>();
   for (const e of entries) {
     if (e.merchantBusinessNumber) pushTo(byBizno, biznoKey(e.merchantBusinessNumber), e);
     if (e.merchantKey) pushTo(byKey, merchantNameKey(e.merchantKey), e);
@@ -112,23 +134,45 @@ export function buildMerchantIndex(entries: readonly HistoryEntry[]): MerchantIn
 }
 
 /** 사업자번호 또는 상호키가 일치하는 항목 (중복 제거, 순서 무관) */
-export function lookupMerchant(index: MerchantIndex, ref: MerchantRef): HistoryEntry[] {
+export function lookupMerchant(index: MerchantIndex, ref: MerchantRef): DirectedHistoryEntry[] {
   const a = ref.merchantBusinessNumber ? index.byBizno.get(biznoKey(ref.merchantBusinessNumber)) : undefined;
   const b = ref.merchantKey ? index.byKey.get(merchantNameKey(ref.merchantKey)) : undefined;
   if (!a) return b ? [...b] : [];
   if (!b) return [...a];
-  const set = new Set<HistoryEntry>(a);
+  const set = new Set<DirectedHistoryEntry>(a);
   for (const e of b) set.add(e);
   return [...set];
 }
 
-/** 거래 방향과 양립하는 계정의 이력만 */
-export function filterCompatible(
-  entries: readonly HistoryEntry[],
+/**
+ * 거래 방향과 양립하는 이력만.
+ * 이력에 direction 이 있으면 그것을 엄격히 따르고, 없으면 계정 성격(매입에 수익 계정 불가 등)으로 거른다.
+ */
+export function filterCompatible<T extends DirectedHistoryEntry>(
+  entries: readonly T[],
   direction: Direction,
   accounts: ReadonlyMap<string, AccountCode>,
-): HistoryEntry[] {
-  return entries.filter((e) => isAccountCompatible(e.accountCode, direction, accounts));
+): T[] {
+  return entries.filter((e) => (!e.direction || e.direction === direction) && isAccountCompatible(e.accountCode, direction, accounts));
+}
+
+/** 방향 근거 수: 명시 direction, 없으면 계정 성격(비용·원가=매입, 수익=매출). 자산·부채 계정은 세지 않는다 */
+export interface DirectionSignals {
+  purchase: number;
+  sales: number;
+}
+
+export function countDirectionSignals(
+  items: Iterable<{ direction?: Direction | null; accountCode: string }>,
+  accounts: ReadonlyMap<string, AccountCode>,
+): DirectionSignals {
+  const s: DirectionSignals = { purchase: 0, sales: 0 };
+  for (const e of items) {
+    const d = e.direction ?? accountDirection(e.accountCode, accounts);
+    if (d === 'purchase') s.purchase += 1;
+    else if (d === 'sales') s.sales += 1;
+  }
+  return s;
 }
 
 // ────────────────────────────── 집계 ──────────────────────────────
@@ -272,16 +316,16 @@ export function majorityAccountByCount(entries: readonly HistoryEntry[]): string
  * 수정 우선 원칙: 가장 최근 사람 수정이 전체 이력의 과반(건수 최다) 계정과 다르면,
  * 수정 기준일(포함) 이후 이력만 유효로 본다. 옛 이력이 새 수정을 이겨서 같은 실수를 반복하는 일을 막는다.
  */
-export function applyCorrectionPriority(
-  sortedEntries: readonly HistoryEntry[],
+export function applyCorrectionPriority<T extends HistoryEntry>(
+  sortedEntries: readonly T[],
   point: CorrectionPoint | null,
   majorityAccountCode: string | null,
-): { effective: HistoryEntry[]; superseded: HistoryEntry[] } {
+): { effective: T[]; superseded: T[] } {
   if (!point || !majorityAccountCode || majorityAccountCode === point.accountCode) {
     return { effective: [...sortedEntries], superseded: [] };
   }
-  const effective: HistoryEntry[] = [];
-  const superseded: HistoryEntry[] = [];
+  const effective: T[] = [];
+  const superseded: T[] = [];
   for (const e of sortedEntries) (e.transactionDate >= point.date ? effective : superseded).push(e);
   return { effective, superseded };
 }
@@ -289,14 +333,14 @@ export function applyCorrectionPriority(
 // ────────────────────────────── 수정 기록 인덱스 ──────────────────────────────
 
 export interface CorrectionIndex {
-  byBizno: Map<string, CorrectionRecord[]>;
-  byKey: Map<string, CorrectionRecord[]>;
+  byBizno: Map<string, DirectedCorrectionRecord[]>;
+  byKey: Map<string, DirectedCorrectionRecord[]>;
 }
 
 /** 계정(field='account') 수정 중 실제 변경된 것만 색인 */
-export function buildCorrectionIndex(corrections: readonly CorrectionRecord[], clientId: UUID): CorrectionIndex {
-  const byBizno = new Map<string, CorrectionRecord[]>();
-  const byKey = new Map<string, CorrectionRecord[]>();
+export function buildCorrectionIndex(corrections: readonly DirectedCorrectionRecord[], clientId: UUID): CorrectionIndex {
+  const byBizno = new Map<string, DirectedCorrectionRecord[]>();
+  const byKey = new Map<string, DirectedCorrectionRecord[]>();
   for (const c of corrections) {
     if (c.clientId !== clientId || c.field !== 'account' || !c.after || c.after === c.before) continue;
     if (c.merchantBusinessNumber) pushTo(byBizno, biznoKey(c.merchantBusinessNumber), c);
@@ -306,8 +350,8 @@ export function buildCorrectionIndex(corrections: readonly CorrectionRecord[], c
 }
 
 /** 상대방과 관련된 수정 기록. 양쪽 사업자번호가 모두 있고 다르면 다른 상대방으로 본다. */
-export function lookupCorrections(index: CorrectionIndex, ref: MerchantRef): CorrectionRecord[] {
-  const out = new Set<CorrectionRecord>();
+export function lookupCorrections(index: CorrectionIndex, ref: MerchantRef): DirectedCorrectionRecord[] {
+  const out = new Set<DirectedCorrectionRecord>();
   if (ref.merchantBusinessNumber) for (const c of index.byBizno.get(biznoKey(ref.merchantBusinessNumber)) ?? []) out.add(c);
   if (ref.merchantKey) {
     for (const c of index.byKey.get(merchantNameKey(ref.merchantKey)) ?? []) {
@@ -318,10 +362,24 @@ export function lookupCorrections(index: CorrectionIndex, ref: MerchantRef): Cor
   return [...out].sort(compareCorrection);
 }
 
+/**
+ * 거래 1건당 가장 최근 수정만 남긴다 (정렬: 수정 시각 오름차순).
+ * 같은 거래를 여러 번 고친 것은 "반복 수정"이 아니며, 되돌린 수정은 최종값만 의미가 있다.
+ */
+export function latestCorrectionPerTransaction<T extends CorrectionRecord>(records: readonly T[]): T[] {
+  const m = new Map<string, T>();
+  for (const c of records) {
+    const k = `${c.clientId}|${c.transactionId}`;
+    const prev = m.get(k);
+    if (!prev || compareCorrection(c, prev) > 0) m.set(k, c);
+  }
+  return [...m.values()].sort(compareCorrection);
+}
+
 /** 수정 시각 오름차순 (동시각은 거래ID·수정값으로 결정) */
 export function compareCorrection(a: CorrectionRecord, b: CorrectionRecord): number {
-  const ta = Date.parse(a.createdAt);
-  const tb = Date.parse(b.createdAt);
+  const ta = parseInstant(a.createdAt);
+  const tb = parseInstant(b.createdAt);
   if (!Number.isNaN(ta) && !Number.isNaN(tb) && ta !== tb) return ta - tb;
   if (a.createdAt !== b.createdAt) return a.createdAt < b.createdAt ? -1 : 1;
   if (a.transactionId !== b.transactionId) return a.transactionId < b.transactionId ? -1 : 1;

@@ -432,6 +432,23 @@ describe('보조 함수', () => {
     expect(matchesClientVehicle({ description: '아무거나', merchantName: '', rawData: {} }, ['가1'])).toBe(false);
   });
 
+  it('matchesClientVehicle — 숫자만 등록된 번호는 적요·상호의 독립 숫자열일 때만 (승인번호·금액·카드번호 오탐 방지)', () => {
+    const plate = ['3456'];
+    expect(matchesClientVehicle({ description: '주유 3456', merchantName: '', rawData: {} }, plate)).toBe(true);
+    expect(matchesClientVehicle({ description: '12가 3456', merchantName: '', rawData: {} }, plate)).toBe(true);
+    expect(matchesClientVehicle({ description: '승인 71345612', merchantName: '', rawData: {} }, plate)).toBe(false);
+    expect(matchesClientVehicle({ description: '', merchantName: '', rawData: { 승인번호: '71345612', 카드번호: '1234-****-****-3456', 금액: '134560' } }, plate)).toBe(false);
+    // 정식 번호는 원본 행에서도 찾는다
+    expect(matchesClientVehicle({ description: '', merchantName: '', rawData: { 비고: '12가-3456 주유' } }, ['12가3456'])).toBe(true);
+  });
+
+  it('숫자만 등록된 차량번호가 승인번호에 섞여도 불공제 차량으로 판정하지 않는다', () => {
+    const client = mkClient({ nonDeductibleVehicles: ['3456'] });
+    const v = classifyVat(mkTx({ merchantName: '알파문구', merchantTaxType: 'general', rawData: { 승인번호: '71345612' } }), acc('830'), ctx(client));
+    expect(v.deductible).toBe(true);
+    expect(v.ruleIds).not.toContain('VAT-CAR-01');
+  });
+
   it('buildRuleFacts: 요일·검색텍스트·수임처 사실', () => {
     const f = buildRuleFacts(mkTx({ transactionDate: '2026-09-12', merchantCategory: '소매', description: '비품' }), acc('830'), mkClient());
     expect(f.weekday).toBe(6);
@@ -439,5 +456,62 @@ describe('보조 함수', () => {
     expect(f.searchText).toContain('소매');
     expect(f.clientVatType).toBe('general');
     expect(f.vatType).toBeNull();
+  });
+});
+
+describe('classifyVat — 리뷰 보강 (자동승인 안전장치)', () => {
+  it('사람 규칙이 공제로 지정해도 원천자료가 불공제면 판단불가(검토)', () => {
+    const v = classifyVat(mkTx({ merchantTaxType: 'general', sourceDeductibleHint: false }), acc('830'), {
+      ...ctx(),
+      override: { deductible: true, ruleId: 'r1', ruleName: '문구점 소모품' },
+    });
+    expect(v.deductible).toBeNull();
+    expect(v.confidence).toBeLessThanOrEqual(70);
+    expect(v.summary).toContain('원천자료 공제여부(불공제)가 다릅니다');
+    expect(v.ruleIds[0]).toBe('r1');
+  });
+
+  it('사람 규칙이 불공제로 지정 + 원천 공제 표시 → 불공제 유지 (보수적)', () => {
+    const v = classifyVat(mkTx({ merchantTaxType: 'general', sourceDeductibleHint: true }), acc('830'), {
+      ...ctx(),
+      override: { deductible: false, reasonCode: 'U-1' },
+    });
+    expect(v.deductible).toBe(false);
+    expect(v.nonDeductibleReasonCode).toBe('U-1');
+  });
+
+  it('간이과세자 수임처: 매입은 검토, 사람 규칙(공제)으로도 전액 공제 자동확정 안 됨', () => {
+    const simp = mkClient({ vatType: 'simplified' });
+    const plain = classifyVat(mkTx({ merchantTaxType: 'general' }), acc('830'), ctx(simp));
+    expect(plain.deductible).toBeNull();
+    expect(plain.ruleIds[0]).toBe('VAT-SIMP-01');
+    expect(plain.reasons[0]).toContain('0.5%');
+
+    const ov = classifyVat(mkTx({ merchantTaxType: 'general' }), acc('830'), { ...ctx(simp), override: { deductible: true, ruleId: 'r9' } });
+    expect(ov.deductible).toBeNull();
+    expect(ov.ruleIds[0]).toBe('VAT-SIMP-01');
+
+    const ti = classifyVat(mkTx({ evidenceType: 'tax_invoice' }), acc('830'), ctx(simp));
+    expect(ti.deductible).toBeNull();
+  });
+
+  it('간이과세자 수임처라도 접대비는 불공제 (같은 priority 에서 불공제 우선)', () => {
+    const v = classifyVat(mkTx({ evidenceType: 'tax_invoice' }), acc('813'), ctx(mkClient({ vatType: 'simplified' })));
+    expect(v.deductible).toBe(false);
+    expect(v.nonDeductibleReasonCode).toBe('VAT-ENT-01');
+    expect(v.vatType).toBe('purchase_non_deductible');
+  });
+
+  it('간이과세자 수임처 택시 → 검토 (공급자 업종 불공제는 참고 근거)', () => {
+    const v = classifyVat(mkTx({ merchantName: '서울개인택시' }), acc('812'), ctx(mkClient({ vatType: 'simplified' })));
+    expect(v.deductible).toBeNull();
+    expect(v.ruleIds).toEqual(expect.arrayContaining(['VAT-SIMP-01', 'VAT-CARD-03']));
+    expect(v.reasons.join('\n')).toContain('참고(우선순위 낮음, 불공제)');
+  });
+
+  it('간이과세자 수임처 세액 0 카드 → 불공제(세액 없음) 사실 규칙이 먼저', () => {
+    const v = classifyVat(mkTx({ supplyAmount: 11000, vatAmount: 0 }), acc('830'), ctx(mkClient({ vatType: 'simplified' })));
+    expect(v.deductible).toBe(false);
+    expect(v.ruleIds[0]).toBe('VAT-CARD-00');
   });
 });

@@ -5,6 +5,7 @@ import type {
   Condition,
   ConfidencePolicy,
   CorrectionRecord,
+  Direction,
   MappingRule,
   NormalizedTransaction,
   UUID,
@@ -12,8 +13,8 @@ import type {
 import { evaluateCondition, type ConditionContext } from '../dsl';
 import { sha256Hex } from '../hash';
 import { formatBusinessNumber } from '../normalize';
-import { buildAccountMap, DEFAULT_ACCOUNT_CODES } from '../data/accounts';
-import { compareCorrection } from './history';
+import { accountDirection, buildAccountMap, DEFAULT_ACCOUNT_CODES } from '../data/accounts';
+import { compareCorrection, latestCorrectionPerTransaction, type DirectedCorrectionRecord } from './history';
 
 /**
  * 학습 루프 — 직원 수정(CorrectionRecord)에서 영구 규칙 "제안"을 만든다.
@@ -31,6 +32,12 @@ export interface RuleSuggestion {
   field: 'account';
   fromAccountCode: string | null;
   toAccountCode: string;
+  /**
+   * 규칙 조건에 넣은 거래 방향. 수정 기록의 direction(있으면) 또는 계정 성격으로 추정.
+   * null = 추정 불가 → 방향 조건 없이 제안하고 suggestionReason 에 확인 요청을 남긴다.
+   */
+  direction: Direction | null;
+  /** 반복 수정 횟수 (거래 수 기준 — 같은 거래를 여러 번 고친 것은 1회) */
   correctionCount: number;
   /** classification_corrections.suggested_rule_id 연결 대상 */
   transactionIds: UUID[];
@@ -50,9 +57,10 @@ function isAccountChange(c: CorrectionRecord): boolean {
   return c.field === 'account' && typeof c.after === 'string' && c.after.trim() !== '' && c.after !== c.before;
 }
 
-/** 규칙이 이 상대방을 덮는가 (방향 조건이 있는 규칙도 잡도록 양방향 평가) */
-function ruleMatchesMerchant(cond: Condition, merchantKey: string, bizno: string | null): boolean {
-  for (const direction of ['purchase', 'sales'] as const) {
+/** 규칙이 이 상대방을 덮는가 (방향을 모르면 양방향 평가) */
+function ruleMatchesMerchant(cond: Condition, merchantKey: string, bizno: string | null, direction: Direction | null): boolean {
+  const directions: readonly Direction[] = direction ? [direction] : ['purchase', 'sales'];
+  for (const direction of directions) {
     const ctx: ConditionContext = { merchantKey, merchantName: merchantKey, merchantBusinessNumber: bizno, direction };
     try {
       if (evaluateCondition(cond, ctx)) return true;
@@ -78,12 +86,27 @@ function mostFrequent(values: Array<string | null>): string | null {
 }
 
 /**
+ * 수정 기록 묶음의 거래 방향.
+ * 명시 direction 이 하나로 모이면 그것, 없으면 수정값(→ 없으면 수정 전 값) 계정 성격. 끝내 모르면 null.
+ */
+function inferDirection(records: readonly DirectedCorrectionRecord[], accounts: ReadonlyMap<string, AccountCode>): Direction | null {
+  const explicit = new Set(records.map((r) => r.direction).filter((d): d is Direction => !!d));
+  if (explicit.size === 1) return [...explicit][0]!;
+  if (explicit.size > 1) return null;
+  const byAfter = accountDirection(records[0]?.after ?? null, accounts);
+  if (byAfter) return byAfter;
+  const byBefore = new Set(records.map((r) => accountDirection(r.before, accounts)).filter((d): d is Direction => !!d));
+  return byBefore.size === 1 ? [...byBefore][0]! : null;
+}
+
+/**
  * 반복 수정 → 규칙 제안.
- * 같은 (거래처, 상대방[사업자번호 우선, 없으면 상호키], field='account', 수정값) 이 threshold 회 이상이고,
+ * 같은 (거래처, 상대방[사업자번호 우선, 없으면 상호키], field='account', 수정값) 이 threshold 건(거래 수) 이상이고,
  * 그 수정값이 해당 상대방의 가장 최근 수정과 같으며, 같은 결과의 규칙(활성·제안·거절·비활성)이 없을 때만 제안한다.
+ * 제안 규칙은 매입/매출 방향 조건을 함께 건다 — "쿠팡 → 상품" 규칙이 쿠팡에 대한 매출에 적용되면 안 되기 때문.
  */
 export function analyzeCorrections(
-  corrections: readonly CorrectionRecord[],
+  corrections: readonly DirectedCorrectionRecord[],
   existingRules: readonly MappingRule[],
   policy: ConfidencePolicy,
   accounts: readonly AccountCode[] | ReadonlyMap<string, AccountCode> = DEFAULT_ACCOUNT_CODES,
@@ -91,7 +114,8 @@ export function analyzeCorrections(
   const threshold = Math.max(1, policy.ruleSuggestionThreshold);
   const accMap = accountMapOf(accounts);
   const nameOf = (code: string | null) => (code ? (accMap.get(code)?.name ?? code) : '미분류');
-  const list = corrections.filter(isAccountChange);
+  // 거래 1건당 최종 수정만: 같은 거래를 여러 번 고치거나 되돌린 것은 반복 수정이 아니다
+  const list = latestCorrectionPerTransaction(corrections.filter((c) => c.field === 'account')).filter(isAccountChange);
 
   // 상호키 → 사업자번호 (한 상호키에 사업자번호가 하나뿐이면 같은 상대방으로 묶는다)
   const keyBiznos = new Map<string, Set<string>>();
@@ -109,7 +133,7 @@ export function analyzeCorrections(
     return { bizno, id: `${c.clientId}|${bizno ? `b:${bizno}` : `k:${c.merchantKey}`}` };
   };
 
-  const groups = new Map<string, { bizno: string | null; records: CorrectionRecord[] }>();
+  const groups = new Map<string, { bizno: string | null; records: DirectedCorrectionRecord[] }>();
   for (const c of list) {
     const { bizno, id } = identity(c);
     const g = groups.get(id);
@@ -127,7 +151,8 @@ export function analyzeCorrections(
     const clientId = latest.clientId;
     const merchantKey = mostFrequent(same.map((r) => r.merchantKey)) ?? latest.merchantKey;
     const bizno = g.bizno;
-    const clientRules = existingRules.filter((r) => r.clientId === clientId && ruleMatchesMerchant(r.condition, merchantKey, bizno));
+    const direction = inferDirection(same, accMap);
+    const clientRules = existingRules.filter((r) => r.clientId === clientId && ruleMatchesMerchant(r.condition, merchantKey, bizno, direction));
     // 이미 같은 결과를 내는 규칙이 있거나(활성), 제안 중이거나, 사람이 거절·비활성화했으면 다시 제안하지 않는다
     if (clientRules.some((r) => r.accountCode === latest.after)) continue;
     const conflictingRuleIds = clientRules
@@ -137,19 +162,22 @@ export function analyzeCorrections(
 
     const fromCode = mostFrequent(same.map((r) => r.before));
     const toName = nameOf(latest.after);
-    const condition: Condition = bizno
+    const party: Condition = bizno
       ? { field: 'merchantBusinessNumber', op: 'eq', value: bizno }
       : { field: 'merchantKey', op: 'eq', value: merchantKey };
+    const condition: Condition = direction ? { all: [{ field: 'direction', op: 'eq', value: direction }, party] } : party;
     const label = merchantKey || formatBusinessNumber(bizno);
     let suggestionReason = `동일 수정 ${same.length}회: ${nameOf(fromCode)} → ${toName}`;
+    if (!direction) suggestionReason += ' (매입/매출 방향 미확인 — 승인 전 조건 확인)';
     if (conflictingRuleIds.length > 0) suggestionReason += ' (기존 활성 규칙과 다름 — 대체 검토)';
     const idBasis = [clientId, bizno ? `b:${bizno}` : `k:${merchantKey}`, 'account', latest.after].join('|');
+    const dirLabel = direction === 'purchase' ? ' (매입)' : direction === 'sales' ? ' (매출)' : '';
 
     out.push({
       rule: {
         id: `suggested-${sha256Hex(idBasis).slice(0, 24)}`,
         clientId,
-        name: `${label} → ${toName}`,
+        name: `${label}${dirLabel} → ${toName}`,
         condition,
         accountCode: latest.after,
         accountName: toName,
@@ -166,6 +194,7 @@ export function analyzeCorrections(
       field: 'account',
       fromAccountCode: fromCode,
       toAccountCode: latest.after,
+      direction,
       correctionCount: same.length,
       transactionIds: [...new Set(same.map((r) => r.transactionId))].sort(),
       conflictingRuleIds,
@@ -183,8 +212,11 @@ export function analyzeCorrections(
 
 // ────────────────────────────── 수정 기록 생성 ──────────────────────────────
 
-/** classification_corrections 저장용 (CorrectionRecord + 표시·분석 컬럼) */
-export interface CorrectionDraft extends CorrectionRecord {
+/**
+ * classification_corrections 저장용 (CorrectionRecord + 표시·분석 컬럼).
+ * direction 은 테이블 컬럼이 없으므로 저장하지 않아도 된다 — 읽을 때 transactions.direction 을 조인해 채우면 학습이 방향을 구분한다.
+ */
+export interface CorrectionDraft extends DirectedCorrectionRecord {
   field: 'account';
   beforeLabel: string | null;
   afterLabel: string | null;
@@ -193,7 +225,7 @@ export interface CorrectionDraft extends CorrectionRecord {
 }
 
 export interface CorrectionMeta {
-  tx: Pick<NormalizedTransaction, 'clientId' | 'merchantKey' | 'merchantBusinessNumber'>;
+  tx: Pick<NormalizedTransaction, 'clientId' | 'merchantKey' | 'merchantBusinessNumber'> & Partial<Pick<NormalizedTransaction, 'direction'>>;
   transactionId: UUID;
   userId: UUID;
   /** ISO 시각 — core 는 시계를 직접 읽지 않으므로 호출자가 넘긴다 */
@@ -225,6 +257,7 @@ export function buildCorrection(before: AccountClassification, afterCode: string
     beforeSource: before.source,
     beforeConfidence: before.confidence,
   };
+  if (meta.tx.direction) draft.direction = meta.tx.direction;
   if (meta.reason) draft.reason = meta.reason;
   return draft;
 }

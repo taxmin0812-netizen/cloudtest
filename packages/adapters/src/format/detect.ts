@@ -5,6 +5,7 @@
  * 필수/선택 열 일치율·헤더 설명률·제목(파일명) 힌트로 점수를 매긴다.
  */
 import { sha256Hex, type Direction } from '@mintax/core';
+import { AdapterError } from '../errors';
 import type { TabularFile } from '../file/read';
 import { cellText, isBlankRow, looseHeader, normalizeHeader } from '../util/text';
 import { fieldLabel, type CanonicalField } from './fields';
@@ -122,6 +123,20 @@ export function headerFingerprintOf(headerRow: readonly unknown[]): string {
   return sha256Hex(cells.join('|'));
 }
 
+const rejectCache = new WeakMap<FormatProfile, Set<string>>();
+
+/** 제목행에 이 형식이 아님을 뜻하는 제목(rejectHeaders)이 있는가 */
+function rejectedByHeader(profile: FormatProfile, headerRow: readonly unknown[]): boolean {
+  if (!profile.rejectHeaders || profile.rejectHeaders.length === 0) return false;
+  let set = rejectCache.get(profile);
+  if (!set) {
+    set = new Set(profile.rejectHeaders.map(normalizeHeader));
+    rejectCache.set(profile, set);
+  }
+  for (const c of headerRow) if (set.has(normalizeHeader(c))) return true;
+  return false;
+}
+
 function anchorsSatisfied(profile: FormatProfile, map: ColumnMap): boolean {
   return profile.anchors.some((combo) => combo.every((f) => map[f] !== undefined));
 }
@@ -192,6 +207,13 @@ interface Scored {
   map: ColumnMap;
   score: number;
   hint: boolean;
+  /** 2 = 필수 열 모두 있음, 1 = 필수 열 일부 누락, 0 = 사용자 매핑 전용(generic) */
+  tier: number;
+}
+
+function tierOf(profile: FormatProfile, map: ColumnMap): number {
+  if (profile.requiresUserMapping) return 0;
+  return missingRequired(profile, map).length === 0 ? 2 : 1;
 }
 
 export function detectFormat(rows: readonly (readonly unknown[])[], opts: DetectOptions = {}): FormatDetection {
@@ -207,15 +229,19 @@ export function detectFormat(rows: readonly (readonly unknown[])[], opts: Detect
       if (!row || isBlankRow(row)) continue;
       const map = resolveColumns(profile, row);
       if (!anchorsSatisfied(profile, map)) continue;
+      if (rejectedByHeader(profile, row)) continue;
       const hint = hintMatched(profile, `${preambleText(rows, r)} ${fileText}`);
       const score = scoreProfile(profile, row, map, hint);
-      if (!best || score > best.score) best = { profile, row: r, map, score, hint };
+      const tier = tierOf(profile, map);
+      if (!best || tier > best.tier || (tier === best.tier && score > best.score)) best = { profile, row: r, map, score, hint, tier };
     }
     if (best) scored.push(best);
   }
 
+  // 구조(필수 열 완비)가 파일명·제목 힌트보다 우선한다 — 힌트 10점이 필수 열 누락을 뒤집지 못하게
   scored.sort(
     (a, b) =>
+      b.tier - a.tier ||
       b.score - a.score ||
       Number(b.hint) - Number(a.hint) ||
       Object.keys(b.map).length - Object.keys(a.map).length ||
@@ -266,26 +292,56 @@ export function detectFormat(rows: readonly (readonly unknown[])[], opts: Detect
   };
 }
 
-/** 여러 시트 중 가장 신뢰도 높은 시트를 고른다 (숨김 시트는 보이는 시트가 없을 때만). */
-export function detectFormatInFile(
-  file: TabularFile,
-  opts: DetectOptions = {},
-): { sheetIndex: number; sheetName: string; detection: FormatDetection } {
-  const visible = file.sheets.map((s, i) => ({ s, i })).filter(({ s }) => !s.hidden);
-  const pool = visible.length > 0 ? visible : file.sheets.map((s, i) => ({ s, i }));
-  let best: { sheetIndex: number; sheetName: string; detection: FormatDetection } | null = null;
-  for (const { s, i } of pool) {
-    const detection = detectFormat(s.rows, opts);
-    const better =
-      !best ||
-      Number(!detection.requiresUserMapping) > Number(!best.detection.requiresUserMapping) ||
-      (detection.requiresUserMapping === best.detection.requiresUserMapping && detection.confidence > best.detection.confidence);
-    if (better) best = { sheetIndex: i, sheetName: s.name, detection };
+/** 선택되지 않았지만 거래자료로 보이는 시트 (조용한 누락 방지용 안내) */
+export interface OtherDataSheet {
+  sheetIndex: number;
+  sheetName: string;
+  profileId: string;
+  confidence: number;
+  hidden: boolean;
+}
+
+export interface FileDetection {
+  sheetIndex: number;
+  sheetName: string;
+  detection: FormatDetection;
+  /** 선택 시트 외에 알려진 형식으로 판정되는 시트 — 이번 적재에서 빠지므로 반드시 사용자에게 알린다 */
+  otherDataSheets: OtherDataSheet[];
+}
+
+/**
+ * 여러 시트 중 가장 신뢰도 높은 시트를 고른다 (숨김 시트는 보이는 시트가 없을 때만).
+ * opts.sheetIndex 를 주면 그 시트를 쓴다 (다른 시트를 따로 적재할 때).
+ */
+export function detectFormatInFile(file: TabularFile, opts: DetectOptions & { sheetIndex?: number } = {}): FileDetection {
+  const { sheetIndex: forced, ...detectOpts } = opts;
+  if (forced !== undefined && (!Number.isInteger(forced) || forced < 0 || forced >= file.sheets.length)) {
+    throw new AdapterError('INVALID_CONTEXT', `시트 번호가 올바르지 않습니다 (${forced}). 파일의 시트는 ${file.sheets.length}개입니다.`);
+  }
+  const all = file.sheets.map((s, i) => ({ s, i, detection: detectFormat(s.rows, detectOpts) }));
+  let best: (typeof all)[number] | null = null;
+  if (forced !== undefined) {
+    best = all[forced]!;
+  } else {
+    const visible = all.filter(({ s }) => !s.hidden);
+    for (const x of visible.length > 0 ? visible : all) {
+      const better =
+        !best ||
+        Number(!x.detection.requiresUserMapping) > Number(!best.detection.requiresUserMapping) ||
+        (x.detection.requiresUserMapping === best.detection.requiresUserMapping && x.detection.confidence > best.detection.confidence);
+      if (better) best = x;
+    }
   }
   if (!best) {
-    return { sheetIndex: -1, sheetName: '', detection: detectFormat([], opts) };
+    return { sheetIndex: -1, sheetName: '', detection: detectFormat([], detectOpts), otherDataSheets: [] };
   }
-  return best;
+  const otherDataSheets: OtherDataSheet[] = [];
+  for (const x of all) {
+    if (x === best) continue;
+    const known = x.detection.candidates.find((c) => c.profileId !== GENERIC_V1.id);
+    if (known) otherDataSheets.push({ sheetIndex: x.i, sheetName: x.s.name, profileId: known.profileId, confidence: known.confidence, hidden: !!x.s.hidden });
+  }
+  return { sheetIndex: best.i, sheetName: best.s.name, detection: best.detection, otherDataSheets };
 }
 
 /**

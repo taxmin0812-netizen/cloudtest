@@ -2,7 +2,7 @@
  * 계정과목 판단 엔진 (core-classify) 공개 API.
  * import { classifyAccount, buildClassificationContext } from '@mintax/core/engine/classify-index';
  */
-export { DEFAULT_ACCOUNT_CODES, buildAccountMap, isAccountCompatible } from '../data/accounts';
+export { DEFAULT_ACCOUNT_CODES, accountDirection, buildAccountMap, isAccountCompatible } from '../data/accounts';
 export {
   SYSTEM_DICTIONARY,
   SYSTEM_DICTIONARY_BY_ID,
@@ -18,6 +18,7 @@ export {
   compilePrefilter,
   hasAccountConflict,
   transactionConditionContext,
+  validateClassifyParams,
   type ClassificationContext,
   type ClassificationContextInput,
   type ClassifyParams,
@@ -31,16 +32,22 @@ export {
   buildHistoryIndex,
   buildMerchantIndex,
   consistency,
+  countDirectionSignals,
   daysBetween,
   dominantAccount,
   isoToKstDate,
   latestCorrectedEntry,
+  latestCorrectionPerTransaction,
   lookupMerchant,
   majorityAccountByCount,
+  parseInstant,
   recencyWeight,
   tallyHistory,
   type AccountTally,
   type CorrectionPoint,
+  type DirectedCorrectionRecord,
+  type DirectedHistoryEntry,
+  type DirectionSignals,
   type HistoryIndex,
   type HistoryStats,
   type MerchantIndex,
@@ -53,6 +60,7 @@ export {
   buildAiClassificationInput,
   hasSimilarHistory,
   mergeAiSuggestion,
+  scrubForAi,
   type MergeAiOptions,
 } from './ai-merge';
 export {

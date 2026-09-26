@@ -131,3 +131,19 @@ describe('지급명세서 제출기한 (데이터 기반 주기)', () => {
     expect(findCadenceRule('earned', '2026-12')?.id).toBe('earned_semiannual_until_2026');
   });
 });
+
+describe('설정 데이터 보호', () => {
+  it('공휴일·제출주기 기본 데이터는 동결 — 추가·변경은 옵션으로 전체 목록을 넘긴다', () => {
+    expect(Object.isFrozen(KR_HOLIDAYS)).toBe(true);
+    expect(Object.isFrozen(SUBMISSION_CADENCE_RULES[0])).toBe(true);
+    expect(() => (KR_HOLIDAYS as unknown as unknown[]).push({ date: '2026-10-13', name: '임시' })).toThrow(TypeError);
+    expect(withholdingDueDate('2026-09', false, { holidays: [...KR_HOLIDAYS, { date: '2026-10-12', name: '임시공휴일' }] })).toBe('2026-10-13');
+  });
+  it('2026·2027 음력 명절 날짜 (ICU dangi 대조)', () => {
+    const names = new Map(KR_HOLIDAYS.map((h) => [h.date, h.name]));
+    expect(names.get('2026-02-17')).toBe('설날');
+    expect(names.get('2026-09-25')).toBe('추석');
+    expect(names.get('2027-02-07')).toBe('설날');
+    expect(names.get('2027-09-15')).toBe('추석');
+  });
+});

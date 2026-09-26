@@ -36,6 +36,8 @@ export function adjustedVatConfidence(vat: VatClassification, policy: Confidence
 
 function inferNewMerchant(account: AccountClassification): boolean {
   if (HISTORY_SOURCES.has(account.source)) return false;
+  // 업종 패턴의 historyCount 는 '다른 수임처' 이력 건수라 이 수임처의 거래 경험이 아니다
+  if (account.source === 'industry_pattern') return true;
   return !((account.evidence.historyCount ?? 0) > 0);
 }
 

@@ -143,3 +143,16 @@ export function isAccountCompatible(
   if (direction === 'purchase') return acc.category !== 'revenue';
   return acc.category !== 'expense' && acc.category !== 'cogs';
 }
+
+/**
+ * 계정 성격만으로 확정되는 거래 방향.
+ * 비용·원가 → 매입, 수익 → 매출. 자산·부채·자본·미등록 계정은 양방향 가능(예: 상품은 매입, 외상매출금은 입금)이라 null.
+ */
+export function accountDirection(code: string | null, accounts: ReadonlyMap<string, AccountCode>): Direction | null {
+  if (!code) return null;
+  const acc = accounts.get(code);
+  if (!acc) return null;
+  if (acc.category === 'expense' || acc.category === 'cogs') return 'purchase';
+  if (acc.category === 'revenue') return 'sales';
+  return null;
+}

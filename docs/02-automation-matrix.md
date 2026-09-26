@@ -25,7 +25,7 @@
 
 | 등급 | 정의 | 시스템 동작 | 사람 역할 | `ReviewLevel` / 상태 | 사후 통제 |
 |---|---|---|---|---|---|
-| **A 완전자동** | 규칙이나 이력으로 판정이 결정적이고, 틀려도 전송 전 대사나 사후 표본에서 잡힌다 | 판정하고 확정하며 다음 단계까지 진행 | 없음 (표본감사만) | `auto` → `auto_approved` → `exported` → `reconciled` | 표본감사 [설정값: 도입 3개월 5%, 이후 2%], 사후 수정률 감시 |
+| **A 완전자동** | 규칙이나 이력으로 판정이 결정적이고, 틀려도 전송 전 대사나 사후 표본에서 잡힌다 | 판정하고 확정하며 다음 단계까지 진행 | 없음 (표본감사만) | `auto` → `auto_approved` → `exported` → `reconciled` | 표본감사 [설정값: 롤아웃 단계별 10% → 5% → 3% → 2%, §3.6], 사후 수정률 감시 |
 | **B 승인형 자동화** | 시스템이 판정하거나 초안을 만들고 근거를 제시하며, 사람은 1클릭으로 승인하거나 1필드를 수정한다 | 판정, 근거, 대안 후보를 미리 채움 | 확인·승인 (건별 또는 일괄) | `quick_review` → `needs_review` → `approved` | 수정이 곧 학습 데이터(`classification_corrections`) |
 | **C 전문가 검토** | 판단이 사실관계, 목적, 법 해석에 달려 있어 데이터만으로 확정할 수 없다 | 탐지, 자료 수집, 근거 제시만 함. 판정을 제안하지 않거나 "판단불가"로 둠 | 판단하고 확정하며 사유를 기록 | `must_review` → `needs_review` → `approved` 또는 `excluded` | 사유 필수 입력. severity `high`는 관리자(manager) 확인을 권장 |
 
@@ -37,10 +37,15 @@
 ### 1.2 거래 단위 등급 결정 순서
 
 ```
-1) Risk 플래그 중 bucket ∈ C_BUCKETS 이고 severity = 'high'  → must_review (C)
-      C_BUCKETS [설정값] = possible_asset, personal_use, entertainment, unclassified
+1) 거래의 buckets(Risk 플래그 버킷 + 분류 단계 버킷)에 C_BUCKETS 가 하나라도 있고,
+   그 버킷의 "B로 내려가는 조건"(§1.3)을 충족하지 않으면          → must_review (C)
+      C_BUCKETS [설정값] = §1.3에서 기본 등급이 C인 버킷
+        = account_conflict, high_amount, unclassified, possible_asset,
+          personal_use, entertainment, export_error
+      severity = 'high' 이면 C 처리 후 관리자(manager) 확인을 권장한다(§1.1)
 2) 거래처 섀도 기간(온보딩 후 N개월 [설정값: 2]) 이면, A 후보도 → quick_review (B)
       단, 과거 이력 역수입(source='wehago')으로 만든 exact_history 99는 예외로 A를 허용한다
+      (과거 기장 오류를 답습할 수 있으므로 섀도 기간 표본감사 10%는 이 건을 우선 추출한다)
 3) reviewLevelFor(confidenceScore, policy, blockedByRisk)
       auto → A,  quick_review → B,  must_review → C
 4) 해당 세부 작업의 상한(ceiling, §2)을 적용한다: 최종 등급 = min(3의 결과, 상한)
@@ -49,6 +54,8 @@
 - **주의 (구현 요구)**: 현재 `core/policy.reviewLevelFor`는 차단 플래그가 있어도 신뢰도가 80 이상이면 `quick_review`(B)를 돌려준다.
   - 그래서 접대·개인사용·자산처럼 C여야 하는 건이 B로 내려갈 수 있다.
   - 계약 파일은 바꾸지 않는다. **분류 파이프라인 모듈이 1)번 상향 규칙을 `reviewLevelFor` 앞에 적용**한다.
+  - 1)번은 §1.3 표와 같은 목록을 써야 한다. 목록이 다르면 표에서 C인 버킷이 파이프라인에서는 B로 처리된다.
+  - 현재 `core/engine/decide.ts`는 severity `high` 플래그만 C로 올린다. `account_conflict`는 버킷만 붙이고 자동승인을 막지 않는다. 그래서 1순위 99, 2순위 90인 거래도 `auto`가 될 수 있다. 1)번을 적용하면 이 건은 C가 된다.
 - `CONFIDENCE_LADDER`를 기본 문턱 95와 함께 보면, 자동승인(A)에 도달하는 출처는 `user_rule`(99), `exact_history`(99), `name_history`(97)뿐이다. `industry_pattern`(93)과 `ai`(상한 85)는 설계상 B까지만 간다.
 
 ### 1.3 Exception 버킷별 기본 등급
@@ -87,7 +94,7 @@
 |---|---|---|---|---|---|---|---|
 | CARD-01 | 파일 수집, 형식 판별 | B | A | A | 헤더 앵커(`승인일자`+`가맹점사업자번호`+`공제여부결정`)와 레이아웃 지문 | 모르는 지문의 레이아웃 등록 승인 | `import_jobs.format_profile` |
 | CARD-02 | 정규화 (일자·금액·사업자번호 체크섬·카드 마스킹) | A | A | A | `normalizeDate`, `parseWon`, `isValidBusinessNumber`, `maskCardNumber` | 실패 행 사유 확인 | `transaction_sources.outcome = 'failed'` |
-| CARD-03 | 확정 중복 제거 | A | A | A | `computeFingerprint`가 같으면 중복 | — | `status = 'duplicate'`, `duplicate_of_id` |
+| CARD-03 | 확정 중복 제거 | A | A | A | `computeFingerprint`가 같으면 중복. **전제**: 승인번호 없는 카드 행은 `동일키 내 순번`을 `originalSourceId`로 넣어 `src` 경로를 탄다(문서 01 §4.1). 순번이 없는 `row` 경로 일치는 이 작업이 아니라 CARD-04(B)로 보낸다 | — | `status = 'duplicate'`, `duplicate_of_id` |
 | CARD-04 | 중복 의심 (승인번호가 다르고 같은 날·같은 금액) | B | B | B | `possibleDuplicateKey` | 중복 여부 확정 | `duplicate` |
 | CARD-05 | 취소·부분취소 상계 | B | A | A | 음수 금액과 같은 카드·가맹점·금액 매칭 | 매칭 실패 건 | — |
 | CARD-06 | 사업용카드 여부 | B | A | A | `client_business_profiles.business_cards[].masked`와 대조 | 미등록 카드 처리 결정 | `personal_use` |
@@ -120,7 +127,7 @@
 |---|---|---|---|---|---|---|---|
 | INV-01 | 목록 엑셀 파싱 (헤더 자동탐지, 중복 헤더를 위치로 매핑) | A | A | A | 앵커 `작성일자`+`승인번호`+`공급가액` | — | 연구 02 §4.2 |
 | INV-02 | 승인번호 중복 제거 | A | A | A | fingerprint `inv` 경로 | — | — |
-| INV-03 | WEHAGO 기반영분 중복 차단 | B | A | A | 역수입 매입매출장과 키 대조(과세유형 포함 키와 제외 키 두 번) | 불일치 건 | `extra_in_wehago` |
+| INV-03 | WEHAGO 기반영분 중복 차단 | B | A | A | 역수입 매입매출장과 건수 기준(멀티셋) 키 대조. 과세유형 포함 키와 제외 키로 두 번 한다. 일치 건은 제외하지 않고 업로드를 보류한다(문서 01 §6.2) | 보류 건 확인 | `duplicate` |
 | INV-04 | 매출 전표 (11 과세 / 13 면세) | B | A | A | 거래처 매출계정 고정 규칙. **12 영세는 B 유지**(내국신용장 등 서류 필요) | 영세율 건 | — |
 | INV-05 | 매입 계정: 반복 공급자 | A | A | A | `exact_history` 99 | — | — |
 | INV-06 | 매입 계정: 신규 공급자 | B | B | B | 업종 패턴, AI | 1회 확인 | `new_merchant` |
@@ -161,16 +168,16 @@
 | VAT-08 | 사업자등록 전 매입 | C | C | B | 개업일 필드가 없음(§3.5, VAT-REG-01) | 판단 | — |
 | VAT-09 | 홈택스 `공제여부결정`과 엔진 판정 불일치 | B | B | B | 두 값 비교(VAT-CARD-16) | 채택 값 결정 | `vat_review` |
 | VAT-10 | 의제매입세액 공제 대상 식별 | B | A | A | 업종 적격 + 면세 농축수산물 계산서 반복 공급자(VAT-DEEM-01·03) | — | 공제율·한도는 신고 때 사람이 판단 |
-| VAT-11 | WEHAGO 불공제사유 선택 (54) | B | B | A | `nonDeductibleReasonCode`를 사유 텍스트로 제공 | WEHAGO에서 사유 선택 | 사유 번호표 미확보(연구 01 U6, 연구 04 U3) |
+| VAT-11 | WEHAGO 불공제사유 선택 (54) | B | B | A | `nonDeductibleReasonCode`를 사유 텍스트로 제공 | WEHAGO에서 사유 선택 | 법정 서식(별지 제22호) 사유 ①~⑧은 확인됨. WEHAGO 사유 번호 매핑은 3번만 확인(연구 01 U6, 연구 04 U3) |
 | VAT-12 | 공제받지못할매입세액명세서 합계 검증 | B | A | A | 54 전표 합계 = 명세서 합계 | — | — |
 
 ### 2.6 일반전표 처리 (GJ)
 
 | ID | 세부 작업 | 도입 | 목표 | 상한 | 시스템 판정 근거 | 사람 역할 | 관련 데이터·버킷 |
 |---|---|---|---|---|---|---|---|
-| GJ-01 | 카드대금 출금 → 미지급금 상계 | B | A | A | 적요의 카드사명 + 전월 이용 합계와 일치 | 불일치 건 | — |
+| GJ-01 | 카드대금 출금 → 미지급금 상계 | B | A | A | 적요의 카드사명 + 해당 카드 결제 청구액과 1원 단위 일치. 전월 이용 합계는 이용기간·할부·연회비 때문에 원래 다르므로 기준으로 쓰지 않는다 | 불일치 건 | 카드 청구 데이터(§3.5) |
 | GJ-02 | 급여 이체 ↔ 급여대장 차인지급액 | B | A | A | `payroll_items.net_pay` 합계와 일치 | 불일치 건 | — |
-| GJ-03 | 세금·4대보험 출금 ↔ 납부서·고지 | B | A | A | `filing_results.amount`와 일치 | 불일치 건 | — |
+| GJ-03 | 세금·4대보험 출금 ↔ 납부서·고지 | B | A | A | 세금은 `filing_results(kind = 'payment_slip').amount`와 일치. 4대보험 고지액은 저장 위치가 없다(§3.5) | 불일치 건 | — |
 | GJ-04 | 거래처 대금 지급·수령 (외상 상계) | B | A | A | 거래처명·사업자번호 일치, 잔액 ≥ 금액 | 부분 지급 | — |
 | GJ-05 | 대표자 입출금 (가지급금·가수금·인출금) | C | C | C | 탐지만 함 (대표자명·본인계좌) | 판단 | — |
 | GJ-06 | 차입·상환·이자 | C | B | B | 상환 스케줄 등록 시 원금·이자 분리 | 확인 | — |
@@ -234,7 +241,7 @@
 | ID | 세부 작업 | 도입 | 목표 | 상한 | 시스템 판정 근거 | 사람 역할 | 관련 데이터·버킷 |
 |---|---|---|---|---|---|---|---|
 | LTX-01 | 특별징수 세액 산출 (소득세 × 10%) | A | A | A | 원천세 확정값 | — | — |
-| LTX-02 | 납세지 결정 | A | A | A | 거래처 사업장 주소(프로필) | — | — |
+| LTX-02 | 납세지 결정 | A | A | A | 거래처 사업장 소재지. 스키마에 주소 필드가 없어 `rule_params`로 우회한다(§3.5). 사업장이 여럿이면 사업장별로 정한다 | 주소 등록 | — |
 | LTX-03 | 위택스 신고·납부서 출력 | B | B | B | 위택스 연동 없음 | 제출 | `local_tax_ready` → `filed` |
 | LTX-04 | 원천세 수정 시 재신고 | B | B | B | 원천세 변경을 감지하면 작업을 다시 열기 | 재제출 | — |
 
@@ -245,7 +252,7 @@
 | SIS-01 | 사업소득 간이지급명세서 생성 (매월) | B | A | A | 확정 사업소득 데이터 | — | `simplified_statement_business` |
 | SIS-02 | 일용근로소득 지급명세서 생성 (매월) | B | A | A | 확정 일용 데이터 | — | `daily_statement` |
 | SIS-03 | 근로소득 간이지급명세서 생성 | B | A | A | 시행일별 제출 주기 [설정값]: 2026년 반기, 2027-01-01 지급분부터 매월 예정(연구 03 §2.5.2, 재유예 여부 확인) | — | `simplified_statement_earned` |
-| SIS-04 | 원천세 신고와 인원·지급액 교차검증 | A | A | A | 1원 단위 일치 | — | 불일치하면 제출 차단 |
+| SIS-04 | 원천세 신고와 인원·지급액 교차검증 | A | A | A | 사업·일용은 같은 지급월과 1원 단위 비교. 근로(반기)는 6개월 지급액 합계와 중복 제거 인원으로 비교(문서 01 §4.12) | — | 설명되지 않은 차이만 제출 차단 |
 | SIS-05 | 제출 | B | B | B | — | 제출 | `filed` |
 
 ### 2.13 각종 신고자료 검토 (REV)
@@ -316,6 +323,8 @@ stateDiagram-v2
 
 **B → A (승인 없이 확정하기)**: 대상 단위(규칙 1개, 또는 거래처 × 상호키)마다 판정하며 아래 네 가지를 모두 충족해야 한다.
 1. 최근 **20건 [설정값] 이상을 무수정으로 승인**했다. 반복 빈도가 낮은 월 1회 작업은 **3개월 연속**이면 된다.
+   - 20건 연속 무수정은 오류율이 약 14% 미만이라는 것만 뒷받침한다(95% 신뢰, 3/n 근사). 오류율 2% 미만을 보이려면 약 150건이 필요하다. 그래서 A 전환 뒤의 표본감사(§3.6)와 사후 수정률(§4.5) 감시가 승격의 **전제**다.
+   - 공제·불공제처럼 세액에 직접 영향을 주는 규칙은 별도 기준 [설정값: 50건]을 둔다.
 2. 그 대상의 수정률(`classification_corrections` 기준)이 **2% 미만 [설정값]**이다.
 3. 세부 작업의 **상한이 A**다. 세무 위험도가 '상'이면서 판정이 정황에 의존하는 작업은 상한이 B다.
 4. 전송 전 대사(`pre_export`)나 사후 표본으로 **오류를 검출할 수 있는 경로**가 있다.
@@ -347,7 +356,7 @@ stateDiagram-v2
 | CARD-05 | B→A | 취소 행 식별 컬럼(음수 금액이나 거래구분) | 같은 카드·가맹점·금액 상쇄 매칭 | 상쇄 후 합계 = 홈택스 순합계, 2개월 연속 |
 | CARD-06 | B→A | 사업용카드 목록 전체(`business_cards`) | 마스킹 번호 일치 | 미등록 카드 0건이 2개월 연속 |
 | CARD-10 | C→B | 거래처가 지정한 접대 가맹점·제외 카드 목록, 가맹점 업종 | `review_rules`(업종·요일·금액) + 거래처 지정 목록 규칙 | 해당 버킷에서 제안값 채택률 ≥ 90% (3개월) |
-| CARD-11 / VAT-04 | C→B→A | `non_deductible_vehicles`, 차량 마스터의 공제 여부(담당자가 등록증을 보고 지정. 경차 규격·정원 기준은 원문 미확인 — 연구 04 U1·U2), 카드-차량 전용 매핑 | 전용카드 + 주유·정비 업종이면 계정과 VAT를 함께 판정(`vatOverride`) | 전용카드 매핑 거래처에서 20건 무수정이면 A |
+| CARD-11 / VAT-04 | C→B→A | `non_deductible_vehicles`, 차량 마스터의 공제 여부(담당자가 등록증 제원을 보고 지정. 기준은 정원 8명 이하 승용, 경차 제외 규격 1,000cc 이하·길이 3.6m 이하·폭 1.6m 이하 [설정값] — 연구 04 U1·U2, 미러 기준 해소), 카드-차량 전용 매핑 | 전용카드 + 주유·정비 업종이면 계정과 VAT를 함께 판정(`vatOverride`) | 전용카드 매핑 거래처에서 20건 무수정이면 A |
 | CARD-13 | C→B | 거래처별 고액 정상 거래처 목록(원재료·임차료), `is_fixed_asset` 계정표 | 정상 고액 거래처 규칙 | 규칙 대상 건 무수정 20건 |
 | CARD-14 / CASH-07 / PAY-10 / BIZ-05 | B→A | **실제 WEHAGO 엑셀서식**(연구 01 U2·U7), 서식 해시 | 템플릿 매핑 | 업로드 1회 성공 + `post_export` 대사 balanced 2회 |
 | CARD-16 | B→A | WEHAGO 매입매출장 export(월 1회 역수입) | 과세유형 포함 키와 제외 키 이중 대조 | blocking 0건이 2개월 연속 |
@@ -358,9 +367,10 @@ stateDiagram-v2
 | ACC-06 | B→A | 거래처별 적용 이력 | `system_rule` | 거래처 적용 후 3개월 무수정 |
 | ACC-08 | C→B | 두 후보 중 하나에 대한 거래처 규칙 | 규칙 우선 | 충돌 건 중 규칙이 결정한 비율 ≥ 80% |
 | ACC-11 | B→A | 거래처 업종(제조·건설 등), 원가 계정 대역 | 업종별 계정 대역 규칙 | 3개월 무수정 |
+| VAT-03 | B→A | 사무소 실데이터의 홈택스 `업종` 값 목록(업종 사전) | 업종 키워드 DSL(문서 01 §4.1). 짧은 키워드 금지, 제외어(`화물`·`도매` 등) 포함 | 키워드별 적중 건을 사람이 전수 확인해 오탐 0건 + 이후 50건 무수정 |
 | VAT-02 | B→A | 가맹점유형 + `sourceDeductibleHint` | VAT 엔진 내장 규칙. **DSL에 `sourceDeductibleHint` 필드가 없다**(§3.5) | 엔진 판정과 홈택스 힌트 일치율 ≥ 99% (3개월) |
 | VAT-11 | B→A | WEHAGO 불공제사유 번호표 전체(연구 01 U6) | `nonDeductibleReasonCode` ↔ 사유번호 매핑 템플릿 | 번호표 확보 + 업로드 대사 balanced |
-| GJ-01~04 | B→A | 급여대장, 납부서, 카드 이용 합계, 거래처 잔액(WEHAGO 거래처원장 역수입) | 금액 매칭 규칙 | 매칭 건 무수정 20건 |
+| GJ-01~04 | B→A | 급여대장, 납부서, 카드사 결제 청구 내역, 4대보험 고지 내역, 거래처 잔액(WEHAGO 거래처원장 역수입) | 금액 매칭 규칙 | 매칭 건 무수정 20건. 청구·고지 데이터가 없는 항목(GJ-01·GJ-03의 4대보험)은 B에 머문다 |
 | GJ-06 | C→B | 대출 상환 스케줄 | 원금·이자 분리 규칙 | 스케줄 등록이 곧 승격 조건 |
 | PAY-03 | B→A | 3개월 급여 이력, 고객 "변동 없음" 회신 기록 | `unchanged` 연속 | 3개월 연속 무수정 |
 | PAY-04 | C→B | 고객 변동 통보 표준 양식(업로드) | 통보값 = 입력값 대조 | 표준 양식 사용이 곧 승격 조건 |
@@ -381,6 +391,9 @@ stateDiagram-v2
 | 월 누계·빈도 조건(동일 가맹점 월 N회, 누계 금액)이 없다 | CARD-10, REV-03 | `review_rules.kind = 'account_spike'` / `'repeated_abnormal'` 평가기 |
 | 차종·공제 여부 속성이 없다. `nonDeductibleVehicles`는 차량번호 문자열 목록이다 | VAT-04, CARD-11 | 불공제 차량만 등록하는 규약을 두고, 카드-차량 매핑은 `cardNumberMasked` 조건으로 처리 |
 | 거래처 개업일(사업자등록일)이 없다 | VAT-08 | `client_business_profiles.notes` / `rule_params` |
+| 사업장 소재지(주소)가 없다 | LTX-02 | `rule_params`에 사업장 소재지 시군구를 둔다 |
+| 승인번호 없는 카드 행의 "동일키 내 순번"을 받을 자리가 `computeFingerprint`의 `row` 경로에 없다 | CARD-03 | `originalSourceId`에 순번 포함 키를 채워 `src` 경로를 쓴다. 파일 어댑터는 적용됨. 다른 수집 경로도 같은 키 형식을 따라야 한다(문서 01 §4.1) |
+| 카드사 결제 청구 내역, 4대보험 고지 내역을 저장할 테이블이 없다 | GJ-01, GJ-03 | 청구·고지 파일을 `files`에 보관하고 매칭은 B로 운영 |
 | KPI 경보용 알림 종류가 없다(`notifications.kind` 주석에 없음) | §4 경보 | 대시보드에만 표시 |
 | `system_metrics`에 Auto Classification 분자 컬럼이 없다 | §4 KPI 2 | 조회할 때 계산(§4.3) |
 
@@ -421,14 +434,18 @@ stateDiagram-v2
 | 1 | **No-touch Rate** | 사람이 한 번도 만지지 않고 끝난 거래 비율 | \|E ∩ DONE ∩ touch_count = 0\| ÷ \|E\| | `no_touch / total_transactions` | ↑ | ≥ 55% / ≥ 80% | 전월 대비 −10%p |
 | 2 | **Auto Classification Rate** | 엔진이 정한 계정이 수정 없이 최종값으로 남은 비율 | \|C ∩ 엔진출처 ∩ 계정수정 없음\| ÷ \|C\| | 컬럼 없음(조회 시 계산) | ↑ | ≥ 85% / ≥ 95% | < 80% |
 | 3 | **Manual Review Rate** | 엔진이 사람 검토로 보낸 비율 | \|E ∩ review_level ∈ (quick_review, must_review)\| ÷ \|E\| | `reviewed / total_transactions` | ↓ | ≤ 45% / ≤ 20% | 전월 대비 +10%p |
-| 4 | **Correction Rate** | 사람이 계정이나 VAT를 1회 이상 고친 거래 비율 | \|CORR\| ÷ \|E\| | `corrected / total_transactions` | ↓ | ≤ 12% / ≤ 4% | > 15% |
+| 4 | **Correction Rate** | 사람이 계정이나 VAT를 1회 이상 고친 거래 비율 | \|CORR\| ÷ \|E\| | `corrected / total_transactions` | ↓ | ≤ 15% / ≤ 6% | > 20% |
 | 5 | **Processing Time / Client** | 거래처·월당 사람의 활동 시간(분) | Σ 활동초 ÷ 60 | `processing_seconds / 60` | ↓ | ≤ 140분 / ≤ 80분 (외부 시스템 보정 포함) | 3개월 평균 대비 +30% |
 | 6 | **Exceptions / Client** | 거래처·월당 사람이 처리해야 했던 예외 수 | 거래 예외 + 인건비 예외 + 대사 blocking + 수집 실패 행 + 전송 실패 | `exceptions` | ↓ | ≤ 110 / ≤ 50 | 3개월 평균 대비 +50% |
-| 7 | **Reconciliation Error** | 최신 대사 보고서의 blocking 불일치 수 | Σ phase별 최신 보고서의 `discrepancies[blocking = true]` | `recon_errors` | = 0 | 전송 시점 0 (게이트) / 사후 0 | **1건 이상이면 즉시 알림** (`recon_mismatch`) |
+| 7 | **Reconciliation Error** | 최신 대사 보고서의 blocking 불일치 수 (검토 대기 제외) | Σ phase별 최신 보고서의 `discrepancies[blocking = true AND kind ≠ 'pending_review']` | `recon_errors` | = 0 | 전송 시점 0 (게이트) / 사후 0 | **1건 이상이면 즉시 알림** (`recon_mismatch`) |
 | 8 | **Payroll Manual Touches** | 인건비(근로·사업·일용) 사람 데이터 변경 횟수 | 급여 관련 `audit_logs` data_change 건수 | `payroll_manual_touches` | ↓ | ≤ 16 / ≤ 10 (표준 거래처) | 전월 대비 2배 |
 | 9 | **Manual Touches / Client / Month** | 거래처·월당 사람 조작 총수 | Σ touch_count + 인건비 터치 + 운영 터치 | `manual_touches` | ↓ | ≤ 200 / ≤ 100 (표준 거래처, 현재 추정 414) | 3개월 평균 대비 +30% |
 
 - 목표값은 문서 01 §5.2의 표준 거래처 추정에서 나왔다.
+  - KPI 4는 문서 01 §5.1의 목표 수정률에서 계산했다. |E| ≈ 245건(카드 120 + 현금 25 + 세금계산서 35 + 통장 60 + 수기 5)이다.
+  - 3개월 차: 계정 18건 + 공제여부 18건 → 수정 거래 18~36건(두 수정이 겹치는 정도에 따라 다름) → 7~15%
+  - 12개월 차: 계정 5건 + 공제여부 9건 → 9~14건 → 4~6%
+  - 목표는 겹침이 없는 보수적인 값을 쓴다.
 - 대형·소형 거래처는 5·6·8·9번을 **거래 건수로 정규화한 값**(터치 ÷ |E|)으로 함께 본다.
 
 ### 4.3 KPI별 산식 (PostgreSQL 참조 구현)
@@ -457,9 +474,7 @@ corr AS (                         -- CORR: 수정된 거래 (필드별 플래그
 )
 SELECT
   (SELECT count(*) FROM e)                                                    AS total_transactions,
-  (SELECT count(*) FROM e
-     WHERE review_level = 'auto'
-       AND status IN ('auto_approved','exported','reconciled'))               AS auto_approved,
+  (SELECT count(*) FROM e WHERE review_level = 'auto')                        AS auto_approved,   -- 엔진이 자동승인으로 보낸 건 (현재 상태 무관)
   (SELECT count(*) FROM e
      WHERE touch_count = 0
        AND status IN ('auto_approved','exported','reconciled'))               AS no_touch,
@@ -472,8 +487,18 @@ SELECT
        AND NOT EXISTS (SELECT 1 FROM corr
                        WHERE corr.transaction_id = c.id AND corr.acct))      AS auto_classified,
   (SELECT count(*) FROM c)                                                    AS classification_base,
-  (SELECT coalesce(sum(touch_count), 0) FROM tx_all)                          AS tx_touches;
+  (SELECT coalesce(sum(touch_count), 0) FROM tx_all)                          AS tx_touches,
+  (SELECT count(*) FROM e
+     WHERE review_level = 'auto'
+       AND EXISTS (SELECT 1 FROM corr WHERE corr.transaction_id = e.id))      AS auto_corrected,  -- §4.5 분자
+  (SELECT count(*) FROM e
+     WHERE review_level = 'auto' AND touch_count > 0)                         AS auto_touched;    -- §4.5 분자
 ```
+
+- `system_metrics.auto_approved`는 `reviewed`와 짝을 이루는 **라우팅 건수**다. 엔진이 `auto`로 보낸 건을 현재 상태와 관계없이 센다.
+  - 상태 조건(`status IN DONE`)을 붙이면 안 된다. 사후 수정으로 `approved` 등으로 바뀐 자동승인 건이 분모에서 빠진다. 그러면 §4.5의 자동승인 사후 수정률이 부풀려지고, 개입률은 반대로 줄어든다.
+  - 이 정의는 §4.4의 "`review_level`은 엔진 판정값을 유지한다" 규약을 전제로 한다.
+- `auto_corrected`와 `auto_touched`는 `system_metrics`에 컬럼이 없다. 조회할 때 계산한다.
 
 **KPI 1. No-touch Rate** = `no_touch / total_transactions`
 - 아직 `imported`·`classified`·`needs_review`인 건은 분모에는 들어가고 분자에는 들어가지 않는다. 끝나지 않은 일은 No-touch가 아니다.
@@ -495,25 +520,55 @@ SELECT
 - `processing_seconds` 산정 규칙: 사람 행위자(`actor_id IS NOT NULL`)의 `audit_logs`(category ∈ `data_change`, `download`)를 행위자별 시간순으로 정렬한다.
   - 직전 이벤트가 **같은 거래처**이면 두 이벤트 사이 간격을 `min(간격, 300초 [설정값])`로 인정한다.
   - 직전 이벤트가 다른 거래처이거나 없으면 **30초**를 인정한다(맥락 전환 기본값).
-  - 기간 귀속은 §4.4 터치 귀속 규칙과 같다.
+  - **기간 귀속**: 이벤트마다 인정 초를 먼저 계산한 뒤, 이벤트 대상 엔티티의 기간으로 귀속한다. 다른 KPI와 같은 기준이다(§4.1).
+    - `transaction` → `transactions.period`
+    - `import_job`·`export_job`·`filing_job` → 각 `period`, `filing_result` → 소속 `filing_jobs.period`
+    - `payroll_month`·`payroll_item` → 급여월 `period`
+    - 대상 기간을 알 수 없는 이벤트(`employee` 등) → 발생 시각의 KST 연월
+  - 간격(lag)은 기간으로 거르기 **전에** 계산한다. 담당자가 여러 기간을 번갈아 처리할 때 간격이 끊기지 않게 하기 위해서다.
+  - 활동 창 `:from`~`:to`는 해당 기간 1일 0시(KST)부터 재계산 시점까지다(§4.1 최근 3개 기간 재계산).
 
 ```sql
-WITH ev AS (
-  SELECT a.actor_id, a.client_id, a.created_at,
+WITH ev AS (                                  -- 1) 행위자별 시간순 간격 (기간 필터 전)
+  SELECT a.actor_id, a.client_id, a.entity_type, a.entity_id, a.created_at,
          lag(a.created_at) OVER w AS prev_at,
          lag(a.client_id)  OVER w AS prev_client
   FROM audit_logs a
   WHERE a.actor_id IS NOT NULL
     AND a.category IN ('data_change', 'download')
-    AND a.created_at >= :from AND a.created_at < :to   -- 귀속 조인은 §4.4 참조
+    AND a.created_at >= :from AND a.created_at < :to
   WINDOW w AS (PARTITION BY a.actor_id ORDER BY a.created_at)
+),
+sec AS (                                      -- 2) 이벤트별 인정 초
+  SELECT ev.*,
+         CASE WHEN client_id IS NOT NULL AND prev_client = client_id
+              THEN least(extract(epoch FROM created_at - prev_at), 300)
+              ELSE 30 END AS secs
+  FROM ev
+),
+attr AS (                                     -- 3) 대상 엔티티의 기간으로 귀속
+  SELECT s.client_id, s.secs,
+         coalesce(t.period, ij.period, ej.period, fj.period, fjr.period, pm.period, pmi.period,
+                  to_char(s.created_at AT TIME ZONE 'Asia/Seoul', 'YYYY-MM')) AS period
+  FROM sec s
+  -- CASE 안에서만 uuid로 바꿔 PK 인덱스를 쓴다 (entity_id::text 비교는 전체 스캔)
+  LEFT JOIN transactions    t   ON t.id   = CASE WHEN s.entity_type = 'transaction'   THEN s.entity_id::uuid END
+  LEFT JOIN import_jobs     ij  ON ij.id  = CASE WHEN s.entity_type = 'import_job'    THEN s.entity_id::uuid END
+  LEFT JOIN export_jobs     ej  ON ej.id  = CASE WHEN s.entity_type = 'export_job'    THEN s.entity_id::uuid END
+  LEFT JOIN filing_jobs     fj  ON fj.id  = CASE WHEN s.entity_type = 'filing_job'    THEN s.entity_id::uuid END
+  LEFT JOIN filing_results  fr  ON fr.id  = CASE WHEN s.entity_type = 'filing_result' THEN s.entity_id::uuid END
+  LEFT JOIN filing_jobs     fjr ON fjr.id = fr.filing_job_id
+  LEFT JOIN payroll_months  pm  ON pm.id  = CASE WHEN s.entity_type = 'payroll_month' THEN s.entity_id::uuid END
+  LEFT JOIN payroll_items   pi  ON pi.id  = CASE WHEN s.entity_type = 'payroll_item'  THEN s.entity_id::uuid END
+  LEFT JOIN payroll_months  pmi ON pmi.id = pi.payroll_month_id
 )
-SELECT client_id,
-       sum(CASE WHEN prev_client = client_id
-                THEN least(extract(epoch FROM created_at - prev_at), 300)
-                ELSE 30 END)::int AS processing_seconds
-FROM ev GROUP BY client_id;
+SELECT client_id, sum(secs)::int AS processing_seconds
+FROM attr
+WHERE client_id = :client_id AND period = :period
+GROUP BY client_id;
 ```
+
+- 이 SQL은 위 엔티티들의 `entity_id`가 uuid 문자열이라는 규약을 전제로 한다(§4.4).
 
 - 한계: WEHAGO, 홈택스, 위택스 안의 작업 시간은 측정되지 않는다. 분기 1회 타임스터디로 구한 보정 계수를 곱한 값을 목표와 비교한다.
 
@@ -544,8 +599,12 @@ FROM (
   ORDER BY phase, created_at DESC            -- phase(pre_export, post_export)별 최신 보고서
 ) r
 CROSS JOIN LATERAL jsonb_array_elements(r.report -> 'discrepancies') d
-WHERE (d ->> 'blocking')::boolean;
+WHERE (d ->> 'blocking')::boolean
+  AND d ->> 'kind' <> 'pending_review';     -- 검토 대기는 진행 중인 일이지 대사 오류가 아니다
 ```
+
+- `pending_review`를 빼는 이유: 대사 엔진(`core/engine/reconcile.ts`)은 검토 대기가 남아 있으면 `pending_review`를 blocking으로 만든다. 월중에 `pre_export` 대사를 돌릴 때마다 이 건이 KPI와 즉시 알림에 잡히면 알림이 무의미해진다. 검토 대기 잔량은 §4.5 "미검토 잔량"으로 따로 본다.
+- 경로 A 범위의 `extra_in_wehago`(이중 기장 신호)는 엔진이 `blocking = false`로 만든다. 그래서 이 KPI에 잡히지 않는다. §4.5 보조 지표로 따로 센다(문서 01 §6.2).
 
 - `reconciliation_jobs.report`에는 `ReconciliationReport`를 그대로 직렬화해 저장한다는 전제다(구현 규약).
 - 보조 지표: 불일치 금액 합계 `sum(abs((d->>'amount')::bigint))`, 대사 실패 거래처 수(`balanced = false`인 최신 작업).
@@ -624,8 +683,9 @@ KPI가 의미를 가지려면 서버와 웹 구현이 아래 규칙을 지켜야
 
 | 지표 | 공식 | 기준 | 용도 |
 |---|---|---|---|
-| **자동승인 사후 수정률** (Auto-approval Error) | \|CORR ∩ review_level = 'auto'\| ÷ `auto_approved` | < 1% 목표, **2% 초과 시 강등**(§3.2) | No-touch Rate를 부풀리는 것을 막는 짝 지표 |
-| 자동승인 후 개입률 | (`auto_approved` − `no_touch`) ÷ `total_transactions` | < 3% | 자동승인했는데 사람이 다시 만지는 비율 |
+| **자동승인 사후 수정률** (Auto-approval Error) | `auto_corrected` ÷ `auto_approved` = \|CORR ∩ review_level = 'auto'\| ÷ \|E ∩ review_level = 'auto'\| | < 1% 목표, **2% 초과 시 강등**(§3.2) | No-touch Rate를 부풀리는 것을 막는 짝 지표 |
+| 자동승인 후 개입률 | `auto_touched` ÷ `auto_approved` = \|E ∩ review_level = 'auto' ∩ touch_count > 0\| ÷ \|E ∩ review_level = 'auto'\| | < 3% | 자동승인했는데 사람이 다시 만지는 비율 |
+| 경로 A 이중 기장 신호 | 최신 `post_export` 보고서의 `extra_in_wehago` 건수 (경로 A 증빙 범위) | 0 | KPI 7에 잡히지 않는 이중 기장 탐지 |
 | 규칙 커버리지 | \|E ∩ classification_source = 'user_rule'\| ÷ \|E\| | 12개월 ≥ 40% | 학습 루프가 도는지 확인 |
 | 섀도 일치율 | 최초 `classification_results.account.accountCode` = 최종 `transactions.account_code` 비율 | ≥ 97%이면 A 활성 | 롤아웃 게이트(§3.6) |
 | 미검토 잔량 | \|E ∩ status = 'needs_review'\| | 전송 시점 0 | 운영 |
@@ -647,7 +707,8 @@ KPI가 의미를 가지려면 서버와 웹 구현이 아래 규칙을 지켜야
 | USER_ACTION | 실제 WEHAGO 엑셀서식(매입매출, 일반전표 매칭 설정, 급여 1줄·2줄, 사업소득, 일용). CARD-14·PAY-10 등의 B→A 승격 조건 |
 | USER_ACTION | WEHAGO 불공제사유 번호표. VAT-11 B→A 조건 |
 | USER_ACTION | 위멤버스 통합자료·신고리스트 ZIP 실제 샘플. CARD-01·FIL-01·FIL-02 조건 |
-| USER_ACTION | [설정값] 기본값 승인: 자동승인 95, 빠른검토 80, 규칙 제안 3회, B→A 무수정 20건, 사후 수정률 2%, 자산 기준 100만원, 급여 변동 ±20%, 표본감사 5%→2% |
+| USER_ACTION | [설정값] 기본값 승인: 자동승인 95, 빠른검토 80, 규칙 제안 3회, B→A 무수정 20건(세액 영향 규칙 50건), 사후 수정률 2%, 자산 기준 100만원, 급여 변동 ±20%, 표본감사 10%→5%→3%→2% |
 | USER_ACTION | §3.5 계약 공백을 core 계약 담당자에게 변경 요청할지 결정 |
 | USER_ACTION | §4.4 계측 계약(`review_level` 보존, audit action 명명)을 서버·웹 구현팀과 합의 |
-| 검증필요 | 근로소득 간이지급명세서 2027 매월 전환의 재유예 여부, 간이지급명세서 가산세율(보도 기반), 원천세 신고서 소득종류 코드, 현금영수증 용도 구분 컬럼, 차량 경차 규격·정원 기준, 홈택스 가맹점유형의 간이과세자 구분 여부 |
+| USER_ACTION | 구현팀 전달: 파일 어댑터 외 경로의 카드 순번 키 통일(CARD-03, §3.5), 경로 A 범위 `extra_in_wehago` 처리(문서 01 §6.2), `account_conflict` 등 C 버킷 상향(§1.2), KPI 7의 `pending_review` 제외(§4.3) |
+| 검증필요 | 근로소득 간이지급명세서 2027 매월 전환의 재유예 여부, 원천세 신고서 총지급액과 간이지급명세서의 비과세 포함 범위, 원천세 신고서 소득종류 코드, 현금영수증 용도 구분 컬럼, 차량 경차 규격·정원 기준의 law.go.kr 원본 대조, 홈택스 가맹점유형의 간이과세자 구분 여부, 홈택스 `업종` 원문 표기 |

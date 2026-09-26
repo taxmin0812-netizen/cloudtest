@@ -306,3 +306,94 @@ describe('reconcile — WEHAGO 역수입 비교', () => {
     expect(r.discrepancies.find((d) => d.kind === 'amount_mismatch')!.message).toContain('WEHAGO 금액이 전송 금액과 다릅니다');
   });
 });
+
+describe('reconcile — 리뷰 보강 (행·거래 연결)', () => {
+  it('중복 행이 이전 자료의 원래 거래를 가리켜도 원래 거래는 전송 대상으로 남는다', () => {
+    // 원래 거래 t1 은 지난 수집(원본 행 없음)에서 들어와 승인됨, 이번 파일 5행이 그 중복
+    const t1 = tx('t1', 11000, { transactionDate: '2026-09-12', merchantName: 'ABC마트' });
+    const rows = [row(5, t1, { outcome: 'duplicate' })];
+    const r = reconcile({ source: { rows }, transactions: [t1], exportRows: [exp(t1)], scope });
+    expect(r.expected).toMatchObject({ count: 1, totalAmount: 11000 });
+    expect(r.equation.terms.duplicate).toMatchObject({ count: 1, totalAmount: 11000 });
+    expect(r.equation.terms.export).toMatchObject({ count: 1, totalAmount: 11000 });
+    expect(r.balanced).toBe(true);
+    expect(r.exportAllowed).toBe(true);
+    expect(r.discrepancies.map((d) => d.message)).toEqual(['2026-09-12 ABC마트 11,000원 거래가 중복판정으로 제외되었습니다.']);
+  });
+
+  it('같은 파일의 정상 행과 그 중복 행이 같은 거래를 가리켜도 합쳐 세지 않는다 (금액 불일치 오보 없음)', () => {
+    const t1 = tx('t1', 55000);
+    const rows = [row(1, t1), row(2, t1, { outcome: 'duplicate' })];
+    const r = reconcile({ source: { rows }, transactions: [t1], exportRows: [exp(t1)], scope });
+    expect(r.stages.source).toMatchObject({ count: 2, totalAmount: 110000 });
+    expect(r.equation.terms.duplicate).toMatchObject({ count: 1, totalAmount: 55000 });
+    expect(r.balanced).toBe(true);
+    expect(r.exportAllowed).toBe(true);
+    expect(r.discrepancies.some((d) => d.kind === 'amount_mismatch')).toBe(false);
+    expect(r.discrepancies.some((d) => d.kind === 'extra_in_export')).toBe(false);
+  });
+
+  it('실패 행과 실패 상태 거래가 연결되어 있어도 한 번만 센다', () => {
+    const a = tx('t1', 11000);
+    const f = tx('tf', 0, { status: 'failed', accountCode: null, accountName: null, supplyAmount: 0, vatAmount: 0, totalAmount: 0 });
+    const rows = [row(1, a), { rowNumber: 3, outcome: 'failed' as const, transactionId: 'tf', errorReason: "금액을 해석할 수 없어 수집 실패 (원본: '3,2OO')" }];
+    const r = reconcile({ source: { rows }, transactions: [a, f], exportRows: [exp(a)], scope });
+    expect(r.stages.source!.count).toBe(2);
+    expect(r.equation.terms.failed.count).toBe(1);
+    expect(r.balanced).toBe(true);
+    expect(r.discrepancies.filter((d) => d.kind === 'parse_failed').map((d) => d.message)).toEqual([
+      "3행: 금액을 해석할 수 없어 수집 실패 (원본: '3,2OO')",
+    ]);
+    expect(r.exportAllowed).toBe(false);
+  });
+
+  it('실패 거래가 전송파일에 들어가면 "원본에 없음"이 아니라 수집 실패로 설명', () => {
+    const a = tx('t1', 11000);
+    const f = tx('tf', 5000, { status: 'failed' });
+    const rows = [row(1, a), { rowNumber: 2, outcome: 'failed' as const, transactionId: 'tf', errorReason: '일자 오류' }];
+    const r = reconcile({ source: { rows }, transactions: [a, f], exportRows: [exp(a), exp(f)], scope });
+    const x = r.discrepancies.find((d) => d.kind === 'extra_in_export')!;
+    expect(x.message).toContain('수집 실패 상태인데 전송파일에 포함되어 있습니다');
+    expect(r.exportAllowed).toBe(false);
+  });
+
+  it('사유 문구의 카드번호·주민번호는 가려서 보여준다', () => {
+    const a = tx('t1', 11000);
+    const rows = [row(1, a), { rowNumber: 2, outcome: 'failed' as const, errorReason: "카드번호 형식 오류 (원본: '1234-5678-9012-3456')" }];
+    const ex = tx('t2', 3000, { status: 'excluded', excludedReason: '대표 개인카드 900101-1234567 사용분' });
+    const r = reconcile({ source: { rows: [...rows, row(3, ex)] }, transactions: [a, ex], exportRows: [exp(a)], scope });
+    const msgs = r.discrepancies.map((d) => d.message).join('\n');
+    expect(msgs).not.toContain('5678-9012');
+    expect(msgs).toContain('1234-****-****-3456');
+    expect(msgs).not.toContain('1234567');
+    expect(msgs).toContain('900101-1******');
+  });
+
+  it('검토 전 거래가 전송파일에 들어가도 검토 대기 건수에 포함한다', () => {
+    const a = tx('t1', 11000);
+    const b = tx('t2', 22000, { status: 'needs_review' });
+    const r = reconcile({ source: { rows: [row(1, a), row(2, b)] }, transactions: [a, b], exportRows: [exp(a), exp(b)], scope });
+    expect(r.pendingReview).toMatchObject({ count: 1, totalAmount: 22000 });
+    expect(r.discrepancies.find((d) => d.kind === 'pending_review')!.message).toBe('검토 대기 1건(합계 22,000원)이 남아 있어 전송할 수 없습니다.');
+    expect(r.exportAllowed).toBe(false);
+  });
+
+  it('WEHAGO 매칭: 상호 일치 매칭을 먼저 끝내 다른 거래의 짝을 가로채지 않는다', () => {
+    // 같은 날 같은 합계 두 건. A 는 WEHAGO 상호 표기가 달라 2차 매칭, B 는 상호 일치
+    const a = tx('ta', 10000, { merchantName: 'X상사', supplyAmount: 9091, vatAmount: 909 });
+    const b = tx('tb', 10000, { merchantName: 'Y마트', supplyAmount: 10000, vatAmount: 0, evidenceType: 'invoice_exempt' });
+    const input: ReconcileInput = {
+      source: { rows: [row(1, a), row(2, b)] },
+      transactions: [a, b],
+      exportRows: [exp(a), exp(b)],
+      wehagoRows: [
+        { date: '2026-09-10', merchantName: 'Y마트', supplyAmount: 10000, vatAmount: 0, totalAmount: 10000 },
+        { date: '2026-09-10', merchantName: '(주)엑스상사', supplyAmount: 9091, vatAmount: 909, totalAmount: 10000 },
+      ],
+      scope,
+    };
+    const r = reconcile(input);
+    expect(r.discrepancies).toEqual([]);
+    expect(r.exportAllowed).toBe(true);
+  });
+});

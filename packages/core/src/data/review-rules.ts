@@ -312,7 +312,8 @@ export const DEFAULT_REVIEW_RULES: readonly ReviewRuleDef[] = Object.freeze<Revi
     code: 'RISK-REPEAT-SAMEDAY',
     name: '같은 날 같은 가맹점 반복 결제',
     kind: 'repeated_abnormal',
-    condition: null,
+    // 매출(소매·음식점 카드매출)은 같은 날 반복이 정상이므로 매입만
+    condition: purchase,
     params: { count: 3 },
     bucket: 'duplicate',
     severity: 'warning',
@@ -323,7 +324,8 @@ export const DEFAULT_REVIEW_RULES: readonly ReviewRuleDef[] = Object.freeze<Revi
     code: 'RISK-DUP-AMOUNT',
     name: '같은 날·상대방·금액 거래',
     kind: 'duplicate_amount',
-    condition: null,
+    // 매출은 세금계산서·계산서만 (같은 날 같은 금액 카드·현금영수증 매출은 소매업에서 정상)
+    condition: any(purchase, f('evidenceType', 'in', ['tax_invoice', 'invoice_exempt'])),
     params: { includeHistory: true },
     bucket: 'duplicate',
     severity: 'warning',

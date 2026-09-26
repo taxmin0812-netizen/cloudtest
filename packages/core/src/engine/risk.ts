@@ -128,7 +128,34 @@ export function lookupMerchantHistory(
 /** client_business_profiles.rule_params 형식: { '<code>.<param>': 값 } */
 export type ClientRuleParams = Record<string, number | string | boolean>;
 
-/** 규칙 기본 params 에 수임처 override 를 적용 (기본값 타입으로 변환) */
+/**
+ * 숫자 파라미터 덮어쓰기 값 해석. "3,000,000" · "₩300,000" · "300000원" 허용.
+ * 빈 문자열은 0 이 아니라 '값 없음'이다 (Number('') === 0 이라 기준이 0원이 되는 사고 방지).
+ */
+function parseNumericParam(raw: number | string | boolean): number | null {
+  if (typeof raw === 'number') return Number.isFinite(raw) ? raw : null;
+  if (typeof raw !== 'string') return null;
+  const s = raw.replace(/[,\s₩원]/g, '');
+  if (s === '') return null;
+  const n = Number(s);
+  return Number.isFinite(n) ? n : null;
+}
+
+/** 수임처 rule_params 중 이 규칙의 숫자 파라미터로 해석할 수 없는 값 → 오류 메시지 */
+export function invalidParamOverrides(rule: Pick<ReviewRuleDef, 'code' | 'params'>, overrides?: ClientRuleParams | null): string[] {
+  if (!overrides) return [];
+  const prefix = `${rule.code}.`;
+  const errs: string[] = [];
+  for (const [k, raw] of Object.entries(overrides)) {
+    if (!k.startsWith(prefix)) continue;
+    if (typeof rule.params[k.slice(prefix.length)] === 'number' && parseNumericParam(raw) === null) {
+      errs.push(`rule_params.${k}: 숫자로 해석할 수 없는 값 '${String(raw)}' — 기본값을 사용합니다`);
+    }
+  }
+  return errs;
+}
+
+/** 규칙 기본 params 에 수임처 override 를 적용 (기본값 타입으로 변환). 해석 불가 숫자는 기본값 유지 */
 export function resolveRuleParams(rule: Pick<ReviewRuleDef, 'code' | 'params'>, overrides?: ClientRuleParams | null): Record<string, RuleParamValue> {
   const out: Record<string, RuleParamValue> = { ...rule.params };
   if (!overrides) return out;
@@ -140,8 +167,8 @@ export function resolveRuleParams(rule: Pick<ReviewRuleDef, 'code' | 'params'>, 
     if (Array.isArray(base)) {
       out[name] = typeof raw === 'string' ? raw.split(',').map((s) => s.trim()).filter(Boolean) : [String(raw)];
     } else if (typeof base === 'number') {
-      const n = typeof raw === 'number' ? raw : Number(raw);
-      if (Number.isFinite(n)) out[name] = n;
+      const n = parseNumericParam(raw);
+      if (n !== null) out[name] = n;
     } else if (typeof base === 'boolean') {
       out[name] = raw === true || raw === 'true';
     } else {
@@ -203,6 +230,7 @@ export function validateReviewRule(rule: ReviewRuleDef, overrides?: ClientRulePa
   for (const p of REQUIRED_NUMERIC_PARAMS[rule.kind] ?? []) {
     if (typeof params[p] !== 'number' || !Number.isFinite(params[p])) errs.push(`params.${p}: 숫자 값이 필요합니다`);
   }
+  errs.push(...invalidParamOverrides(rule, overrides));
   return errs;
 }
 
@@ -278,7 +306,8 @@ export function prepareRiskBatch(ctx: RiskContext): PreparedRiskContext {
   const dupCounts = new Map<string, number>();
   const sameDayCounts = new Map<string, number>();
   const batchAccountTotals = new Map<string, number>();
-  const codes = ctx.batchAccountCodes;
+  // 순서가 어긋난 계정 배열로 잘못된 월합계를 만들지 않도록 길이가 같을 때만 쓴다
+  const codes = ctx.batchAccountCodes && ctx.batchAccountCodes.length === ctx.batch.length ? ctx.batchAccountCodes : null;
   ctx.batch.forEach((t, i) => {
     const dk = possibleDuplicateKey(t);
     dupCounts.set(dk, (dupCounts.get(dk) ?? 0) + 1);
@@ -297,7 +326,7 @@ export function prepareRiskBatch(ctx: RiskContext): PreparedRiskContext {
     dupCounts,
     sameDayCounts,
     batchAccountTotals,
-    hasBatchAccounts: !!codes && codes.length === ctx.batch.length,
+    hasBatchAccounts: codes !== null,
     spikeCache: new Map(),
   };
   preparedCache.set(ctx, prepared);
@@ -317,19 +346,29 @@ const EVIDENCE_LABEL: Record<EvidenceType, string> = {
   bank: '통장',
   other: '기타증빙',
 };
+const hasOwn = (o: object, k: string): boolean => Object.prototype.hasOwnProperty.call(o, k);
 const WEEKDAY_LABEL = ['일요일', '월요일', '화요일', '수요일', '목요일', '금요일', '토요일'];
 
 /** {이름} 치환. 없는 이름은 그대로 둔다 */
 export function fillTemplate(template: string, vars: Record<string, string | number | null | undefined>): string {
+  return fillTemplateWith(template, (k) => vars[k]);
+}
+
+/** 템플릿이 실제로 참조하는 이름만 계산한다 (1만 건 평가에서 쓰지 않는 금액 서식화를 피함) */
+function fillTemplateWith(template: string, get: (name: string) => string | number | null | undefined): string {
   return template.replace(/\{(\w+)\}/g, (m, k: string) => {
-    const v = vars[k];
+    const v = get(k);
     return v === undefined || v === null ? m : String(v);
   });
 }
 
+// money.formatWon 과 같은 출력 (Number#toLocaleString('ko-KR') ≡ Intl.NumberFormat('ko-KR').format), 포맷터만 재사용
+const KO_NUMBER = new Intl.NumberFormat('ko-KR');
+const won = (v: number): string => `${KO_NUMBER.format(v)}원`;
+
 function formatParam(name: string, v: RuleParamValue): string {
   if (Array.isArray(v)) return v.join(', ');
-  if (typeof v === 'number') return /threshold|amount/i.test(name) ? formatWon(v) : v.toLocaleString('ko-KR');
+  if (typeof v === 'number') return /threshold|amount/i.test(name) ? won(v) : KO_NUMBER.format(v);
   return String(v);
 }
 
@@ -367,6 +406,14 @@ function computeSpike(
   return result;
 }
 
+export interface EvaluateRisksOptions {
+  /**
+   * tx 가 ctx.batch 에 들어 있는 거래인가 (중복·반복 집계에서 자기 자신을 빼기 위함).
+   * 생략하면 객체 동일성(===)으로 판단한다 → 배치를 복제한 객체로 평가할 때는 반드시 지정할 것.
+   */
+  inBatch?: boolean;
+}
+
 /**
  * 한 거래의 고위험 플래그. prepareRiskBatch() 결과를 넘기면 거래당 O(규칙 수).
  * (준비되지 않은 RiskContext 를 넘기면 첫 호출에서 준비해 캐시한다)
@@ -376,25 +423,32 @@ export function evaluateRisks(
   account: AccountClassification,
   vat: VatClassification | null,
   ctx: RiskContext | PreparedRiskContext,
+  opts: EvaluateRisksOptions = {},
 ): RiskFlag[] {
   const prep = getPrepared(ctx);
   const view = new FactView(buildRuleFacts(tx, account, ctx.client, vat));
-  const hour = view.raw('hour') as number | null;
-  const weekday = view.raw('weekday') as number | null;
-  const baseVars: Record<string, string | number | null> = {
-    merchantName: tx.merchantName || '(상호 없음)',
-    date: tx.transactionDate,
-    amount: formatWon(tx.totalAmount),
-    supplyAmount: formatWon(tx.supplyAmount),
-    vatAmount: formatWon(tx.vatAmount),
-    accountCode: account.accountCode ?? '-',
-    accountName: account.accountName ?? '미분류',
-    evidenceLabel: EVIDENCE_LABEL[tx.evidenceType] ?? tx.evidenceType,
-    currency: tx.currency,
-    vatSummary: vat?.summary ?? '',
-    when: [weekday !== null ? WEEKDAY_LABEL[weekday] : null, hour !== null ? `${hour}시` : null].filter(Boolean).join(' '),
+  // 안내 문구 변수 — 플래그가 실제로 생길 때 템플릿이 참조하는 것만 계산
+  const baseVar = (k: string): string | null | undefined => {
+    switch (k) {
+      case 'merchantName': return tx.merchantName || '(상호 없음)';
+      case 'date': return tx.transactionDate;
+      case 'amount': return won(tx.totalAmount);
+      case 'supplyAmount': return won(tx.supplyAmount);
+      case 'vatAmount': return won(tx.vatAmount);
+      case 'accountCode': return account.accountCode ?? '-';
+      case 'accountName': return account.accountName ?? '미분류';
+      case 'evidenceLabel': return EVIDENCE_LABEL[tx.evidenceType] ?? tx.evidenceType;
+      case 'currency': return tx.currency;
+      case 'vatSummary': return vat?.summary ?? '';
+      case 'when': {
+        const hour = view.raw('hour') as number | null;
+        const weekday = view.raw('weekday') as number | null;
+        return [weekday !== null ? WEEKDAY_LABEL[weekday] : null, hour !== null ? `${hour}시` : null].filter(Boolean).join(' ');
+      }
+      default: return undefined;
+    }
   };
-  const isMember = prep.members.has(tx);
+  const isMember = opts.inBatch ?? prep.members.has(tx);
   const history = ctx.clientHistoryIndex ?? null;
   const flags: RiskFlag[] = [];
 
@@ -426,6 +480,8 @@ export function evaluateRisks(
         break;
       }
       case 'repeated_abnormal': {
+        // 상호·사업자번호가 모두 없으면 '같은 가맹점'이라고 말할 수 없다
+        if (!merchantParty(tx)) break;
         const n = (prep.sameDayCounts.get(`${tx.transactionDate}|${merchantParty(tx)}`) ?? 0) + (isMember ? 0 : 1);
         const min = Number(params.count);
         if (Number.isFinite(min) && n >= min) extra = { sameDayCount: n };
@@ -470,16 +526,16 @@ export function evaluateRisks(
       }
     }
     if (!extra) continue;
-    const vars: Record<string, string | number | null> = { ...baseVars };
-    for (const [k, v] of Object.entries(params)) vars[k] = formatParam(k, v);
-    Object.assign(vars, extra);
+    const x = extra;
+    // 우선순위: 규칙별 계산값(extra) > 파라미터 > 거래 기본 변수
+    const get = (k: string) => (hasOwn(x, k) ? x[k] : hasOwn(params, k) ? formatParam(k, params[k]!) : baseVar(k));
     flags.push({
       ruleCode: rule.code,
       ruleName: rule.name,
       bucket: rule.bucket,
       severity: rule.severity,
       blocksAutoApproval: rule.blocksAutoApproval,
-      message: fillTemplate(rule.messageTemplate, vars),
+      message: fillTemplateWith(rule.messageTemplate, get),
     });
   }
   return flags;

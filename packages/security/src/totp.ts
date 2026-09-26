@@ -3,6 +3,8 @@
  *
  * - 비밀(base32)은 users.mfa_secret_enc 에 encryptField() 로 암호화해 저장한다.
  * - 재사용 방지: 검증에 성공한 time step 을 저장해 두고(lastUsedStep), 같거나 이전 step 의 코드는 거부한다.
+ * - 6자리 코드는 대입 공격에 약하다(window=1 이면 시도당 약 3/1,000,000). 호출 측은 OTP 실패도
+ *   registerFailedLogin()(계정 잠금)과 로그인 속도 제한에 반영해야 한다. 이 모듈은 횟수를 세지 않는다.
  */
 import { createHmac, randomBytes, timingSafeEqual } from 'node:crypto';
 import { blindIndex, getIndexKey } from './crypto';

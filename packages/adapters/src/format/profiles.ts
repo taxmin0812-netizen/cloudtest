@@ -56,6 +56,11 @@ export interface FormatProfile {
   columns: ColumnSpec[];
   /** 헤더 판정용 필수 조합 — 하나라도 전부 매칭되면 후보 */
   anchors: CanonicalField[][];
+  /**
+   * 제목행에 이 제목(normalizeHeader 기준 정확 일치)이 하나라도 있으면 이 형식이 아니다.
+   * 파일명·제목 힌트보다 우선하는 구조적 판별 근거 (예: 세금계산서 ↔ 계산서 분류 열).
+   */
+  rejectHeaders?: string[];
   headerScanRows: number;
   amountRule: AmountRule;
   /** 제목행·파일명에서 찾을 정규식(문자열) — 일치 시 가산점 */
@@ -208,6 +213,9 @@ function invoiceColumns(kind: 'tax' | 'exempt'): ColumnSpec[] {
     );
   } else {
     cols.push(
+      // 면세 계산서 목록에 세액 열이 있는지는 미확인(02 U9) — 있으면 읽어서 0 인지 검사한다
+      { field: 'vatAmount', aliases: ['세액', '부가세'] },
+      { field: 'itemVatAmount', aliases: ['품목세액'] },
       { field: 'invoiceClass', aliases: ['전자계산서분류', '계산서분류'] },
       { field: 'invoiceKind', aliases: ['전자계산서종류', '계산서종류'] },
     );
@@ -226,6 +234,7 @@ export const HOMETAX_TAX_INVOICE_V1: FormatProfile = {
   direction: 'auto',
   columns: invoiceColumns('tax'),
   anchors: [['transactionDate', 'approvalNumber', 'supplyAmount', 'supplierBusinessNumber', 'buyerBusinessNumber']],
+  rejectHeaders: ['전자계산서분류', '전자계산서종류', '계산서분류', '계산서종류'],
   headerScanRows: 30,
   amountRule: { components: ['supplyAmount', 'vatAmount'], totalOnly: 'fail' },
   hintPatterns: ['세금계산서'],
@@ -251,13 +260,16 @@ export const HOMETAX_INVOICE_EXEMPT_V1: FormatProfile = {
   direction: 'auto',
   columns: invoiceColumns('exempt'),
   anchors: [['transactionDate', 'approvalNumber', 'supplyAmount', 'supplierBusinessNumber', 'buyerBusinessNumber']],
+  rejectHeaders: ['전자세금계산서분류', '전자세금계산서종류', '세금계산서분류', '세금계산서종류'],
   headerScanRows: 30,
-  amountRule: { components: ['supplyAmount'], totalOnly: 'exempt', vatAlwaysZero: true },
+  amountRule: { components: ['supplyAmount', 'vatAmount'], totalOnly: 'exempt', vatAlwaysZero: true },
   hintPatterns: ['(?<!세금)계산서', '면세'],
   requiresUserMapping: false,
   status: 'mock',
   verified: false,
-  note: '검증필요: 전자계산서 목록이 세금계산서와 같은 레이아웃인지(세액 열 유무) 미확인(02 U9). 세액 열이 없다고 가정하고 합계=공급가액으로 검산한다.',
+  note:
+    '검증필요: 전자계산서 목록이 세금계산서와 같은 레이아웃인지(세액 열 유무) 미확인(02 U9). 세액 열이 없으면 0 으로, 있으면 0 인지 검사하고 합계=공급가액으로 검산한다. ' +
+    '세금계산서와의 구분은 분류/종류 열 제목(전자계산서분류 ↔ 전자세금계산서분류)이 파일명·제목 힌트보다 우선한다.',
   docsRef: 'docs/research/02-wemembers.md U9',
   knownHeaderFingerprints: [],
   priority: 55,

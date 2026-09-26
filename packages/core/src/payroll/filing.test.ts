@@ -228,3 +228,95 @@ describe('buildSimplifiedStatements — 간이지급명세서 / 일용근로소�
     expect(safeMaskedId(null)).toBeNull();
   });
 });
+
+describe('리뷰 보완 — 주민번호 마스킹 (부분 원문 노출 차단)', () => {
+  it('부분 마스킹·자릿수 이상 입력도 뒷자리 첫 자리 이후는 노출하지 않음', () => {
+    expect(safeMaskedId('900101-12345**')).toBe('900101-1******');
+    expect(safeMaskedId('900101-123456')).toBe('900101-1******');
+    expect(safeMaskedId('9001011******')).toBe('900101-1******');
+    expect(safeMaskedId(' 900101 - 1234567 ')).toBe('900101-1******');
+    expect(safeMaskedId('900101-*******')).toBe('900101-*******');
+    expect(safeMaskedId('900101')).toBe('900101-*******');
+    // 앞자리가 가려진 경우: 뒷자리 숫자를 앞자리로 오인해 내보내지 않음
+    expect(safeMaskedId('******-1234567')).toBe('******-*******');
+    expect(safeMaskedId('unknown')).toBe('******-*******');
+  });
+  it('지급명세서 결과 JSON 에 원문 뒷자리가 남지 않음', () => {
+    const s = buildSimplifiedStatements(
+      [pl('B1', 'business', 1_000_000, { incomeTax: 30_000, localIncomeTax: 3_000 })],
+      [emp('B1', 'business', { businessIncomeCode: '940909', idNumberMasked: '850101-23456**' })],
+      '2026-09',
+    );
+    expect(s.business.rows[0]!.idNumberMasked).toBe('850101-2******');
+    expect(JSON.stringify(s)).not.toContain('23456');
+  });
+});
+
+describe('리뷰 보완 — 신고 요약의 조용한 누락 방지', () => {
+  it('일용 근무일수 누락·지급총액 불일치·근로소득세 0원 → 경고', () => {
+    const r = buildWithholdingReturn(
+      [
+        pl('D1', 'daily', 600_000, { incomeTax: 0 }),
+        pl('E1', 'earned', 3_000_000, { grossPay: 3_100_000, incomeTax: 74_350, localIncomeTax: 7_430 }),
+        pl('E2', 'earned', 3_000_000, { incomeTax: 0 }),
+      ],
+      '2026-09',
+    );
+    expect(r.warnings).toEqual(
+      expect.arrayContaining([
+        '직원D1: 일용직 근무일수가 없어 세액을 계산할 수 없습니다',
+        '직원E1: 지급총액 3,100,000원 ≠ 과세 3,000,000원 + 비과세 0원',
+        expect.stringMatching(/^직원E2: 과세급여 3,000,000원인데 소득세 0원/),
+      ]),
+    );
+  });
+
+  it('정수가 아닌 금액 행은 합계에서 제외하고 excludedLines·경고로 명시 (예외로 중단하지 않음)', () => {
+    const r = buildWithholdingReturn(
+      [pl('B1', 'business', 1_000_000, { incomeTax: 30_000, localIncomeTax: 3_000 }), pl('B2', 'business', 500_000.5, { incomeTax: 15_000, localIncomeTax: 1_500 })],
+      '2026-09',
+    );
+    expect(r.total).toMatchObject({ persons: 1, totalPay: 1_000_000, incomeTax: 30_000 });
+    expect(Number.isSafeInteger(r.total.totalPay)).toBe(true);
+    expect(r.excludedLines).toEqual([{ employeeId: 'B2', name: '직원B2', reason: '원 단위 정수가 아닌 금액(taxablePay, grossPay)' }]);
+    expect(r.warnings[0]).toContain('금액 형식 오류 1건 집계 제외');
+    const s = buildSimplifiedStatements([pl('B2', 'business', 500_000.5)], [], '2026-09');
+    expect(s.business.rows).toEqual([]);
+    expect(s.excludedLines).toHaveLength(1);
+  });
+
+  it('의료보건용역(personalService=false) 소액 사업소득은 0원이 정상 → 불일치 경고 없음', () => {
+    const lines = [pl('B1', 'business', 20_000, { incomeTax: 0 })];
+    expect(buildWithholdingReturn(lines, '2026-09').warnings.some((w) => w.includes('계산 600원'))).toBe(true);
+    expect(buildWithholdingReturn(lines, '2026-09', { personalService: false }).warnings).toEqual([]);
+    expect(buildSimplifiedStatements(lines, [emp('B1', 'business', { businessIncomeCode: '851101' })], '2026-09', { personalService: false }).warnings).toEqual([]);
+  });
+
+  it('간이지급명세서: 지급연월 밖 지급일·근무기간 역전 경고', () => {
+    const s = buildSimplifiedStatements(
+      [pl('E1', 'earned', 3_000_000, { incomeTax: 74_350, localIncomeTax: 7_430, paymentDate: '2026-10-05' })],
+      [emp('E1', 'earned', { resignDate: '2026-06-30' })],
+      '2026-09',
+    );
+    expect(s.warnings).toEqual(
+      expect.arrayContaining(['지급일이 지급연월(2026-09)과 다른 내역 1건 — 지급연월 확인', expect.stringContaining('근무기간 역전(2026-07-01 > 2026-06-30)')]),
+    );
+  });
+
+  it('성능: 10,000행 집계', () => {
+    const lines = Array.from({ length: 10_000 }, (_, i) =>
+      i % 3 === 0
+        ? pl(`B${i}`, 'business', 1_000_000, { incomeTax: 30_000, localIncomeTax: 3_000 })
+        : i % 3 === 1
+          ? pl(`D${i}`, 'daily', 1_000_000, { workDays: 5, incomeTax: 6_750, localIncomeTax: 670 })
+          : pl(`E${i}`, 'earned', 3_000_000, { incomeTax: 74_350, localIncomeTax: 7_430 }),
+    );
+    const t0 = performance.now();
+    const r = buildWithholdingReturn(lines, '2026-09');
+    const s = buildSimplifiedStatements(lines, [], '2026-09');
+    expect(performance.now() - t0).toBeLessThan(3_000);
+    expect(r.total.persons).toBe(10_000);
+    expect(r.total.incomeTax).toBe(3_334 * 30_000 + 3_333 * 6_750 + 3_333 * 74_350);
+    expect(s.business.rows).toHaveLength(3_334);
+  });
+});

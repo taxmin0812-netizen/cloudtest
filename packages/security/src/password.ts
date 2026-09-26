@@ -28,6 +28,8 @@ export const DEFAULT_SCRYPT_PARAMS: Readonly<ScryptParams> = Object.freeze({
 
 /** 저장된 해시에서 읽은 파라미터의 허용 범위 (DB 값으로 메모리 폭주를 일으키지 못하게) */
 const LIMITS = { minN: 2 ** 10, maxN: 2 ** 18, maxR: 32, maxP: 16, minKey: 16, maxKey: 128, minSalt: 8, maxSalt: 64 };
+/** 검증 1회당 scrypt 메모리 상한 (128·N·r). N·r 각각은 범위 안이어도 조합이 1GiB 가 될 수 있어 따로 막는다 */
+const MAX_SCRYPT_MEMORY_BYTES = 256 * 1024 * 1024;
 
 /** 매우 긴 입력으로 인한 CPU 낭비 방지 */
 export const PASSWORD_MAX_LENGTH = 256;
@@ -87,6 +89,7 @@ function parseHash(stored: string): ParsedHash | null {
   const p = Number(pS);
   if (!isPowerOfTwo(N) || N < LIMITS.minN || N > LIMITS.maxN) return null;
   if (r < 1 || r > LIMITS.maxR || p < 1 || p > LIMITS.maxP) return null;
+  if (128 * N * r > MAX_SCRYPT_MEMORY_BYTES) return null;
   if (!B64_RE.test(saltS) || !B64_RE.test(hashS)) return null;
   const salt = Buffer.from(saltS, 'base64');
   const hash = Buffer.from(hashS, 'base64');
@@ -164,12 +167,15 @@ export interface PasswordPolicyContext {
  */
 export function validatePasswordPolicy(password: string, ctx: PasswordPolicyContext = {}): PasswordPolicyResult {
   const errors: string[] = [];
-  const pw = typeof password === 'string' ? password : '';
+  // 해시는 NFKC 정규화한 값으로 만들므로 정책도 같은 값으로 판단한다 (전각 'Ｆ' 를 특수문자로 세지 않도록)
+  const raw = typeof password === 'string' ? password : '';
+  const pw = raw.normalize('NFKC');
 
   if ([...pw].length < PASSWORD_MIN_LENGTH) {
     errors.push(`비밀번호는 ${PASSWORD_MIN_LENGTH}자 이상이어야 합니다.`);
   }
-  if (pw.length > PASSWORD_MAX_LENGTH) {
+  // 최대 길이는 hashPassword/verifyPassword 와 같은 기준(입력 원문 길이)으로 본다
+  if (raw.length > PASSWORD_MAX_LENGTH) {
     errors.push(`비밀번호는 ${PASSWORD_MAX_LENGTH}자 이하여야 합니다.`);
   }
 
@@ -182,7 +188,7 @@ export function validatePasswordPolicy(password: string, ctx: PasswordPolicyCont
   const at = email.indexOf('@');
   if (at > 0) {
     const local = email.slice(0, at);
-    const lower = pw.normalize('NFKC').toLowerCase();
+    const lower = pw.toLowerCase();
     // 'kim+tax@...' → 'kim+tax' 와 'kim' 모두 검사
     const candidates = new Set([local, local.split('+')[0] ?? ''].filter((c) => c.length >= 3));
     if ([...candidates].some((c) => lower.includes(c))) {

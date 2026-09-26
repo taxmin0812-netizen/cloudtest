@@ -378,3 +378,71 @@ describe('성능', () => {
     expect(ms).toBeLessThan(1500);
   });
 });
+
+describe('리뷰 보강 — 파라미터·배치 경계', () => {
+  const high = DEFAULT_REVIEW_RULES.find((r) => r.code === 'RISK-HIGH-AMOUNT')!;
+
+  it('rule_params 숫자: 쉼표·₩·원 허용, 빈 값은 0원이 아니라 기본값 유지 + 검증 오류', () => {
+    expect(resolveRuleParams(high, { 'RISK-HIGH-AMOUNT.threshold': '3,000,000' }).threshold).toBe(3000000);
+    expect(resolveRuleParams(high, { 'RISK-HIGH-AMOUNT.threshold': '₩500,000원' }).threshold).toBe(500000);
+    expect(resolveRuleParams(high, { 'RISK-HIGH-AMOUNT.threshold': '' }).threshold).toBe(1000000);
+    expect(resolveRuleParams(high, { 'RISK-HIGH-AMOUNT.threshold': '백만' }).threshold).toBe(1000000);
+    expect(validateReviewRule(high, { 'RISK-HIGH-AMOUNT.threshold': '' })).toEqual([
+      "rule_params.RISK-HIGH-AMOUNT.threshold: 숫자로 해석할 수 없는 값 '' — 기본값을 사용합니다",
+    ]);
+    expect(validateReviewRule(high, { 'RISK-HIGH-AMOUNT.threshold': '2,000,000' })).toEqual([]);
+    // 빈 값 덮어쓰기로 모든 매입이 고액거래가 되지 않는다
+    expect(codes(risksOf(amt(11000), acc('830'), vatOk, { ruleParams: { 'RISK-HIGH-AMOUNT.threshold': '' } }))).not.toContain('RISK-HIGH-AMOUNT');
+  });
+
+  it('배치를 복제한 객체로 평가할 때 inBatch 로 자기 자신을 빼고 센다', () => {
+    const a = mkTx({ merchantName: 'ABC마트', approvalNumber: '111' });
+    const b = mkTx({ merchantName: '다른상점', approvalNumber: '222' });
+    const ctx = prepareRiskBatch(ctxOf([a, b], { clientHistoryIndex: buildClientHistoryIndex([hist(a.merchantKey, '830'), hist(b.merchantKey, '830')]) }));
+    const clone = { ...a };
+    // 동일성으로는 배치 밖 거래로 보여 자기 자신과 중복 판정됨 → 옵션으로 바로잡는다
+    expect(codes(evaluateRisks(clone, acc('830'), vatOk, ctx))).toContain('RISK-DUP-AMOUNT');
+    expect(codes(evaluateRisks(clone, acc('830'), vatOk, ctx, { inBatch: true }))).not.toContain('RISK-DUP-AMOUNT');
+  });
+
+  it('계정 배열 길이가 배치와 다르면 이번 달 배치 합계를 쓰지 않는다 (어긋난 합계 방지)', () => {
+    const batch = [amt(1500000, { approvalNumber: '1' }), amt(1000000, { approvalNumber: '2', merchantName: '다른상점' })];
+    const totals = { '830': [{ period: '2026-06', total: 1000000 }, { period: '2026-07', total: 1000000 }, { period: '2026-08', total: 1000000 }, { period: '2026-09', total: 500000 }] };
+    const bad = prepareRiskBatch(ctxOf(batch, { accountMonthlyTotals: totals, batchAccountCodes: ['830'] }));
+    expect(bad.prepared.hasBatchAccounts).toBe(false);
+    expect(bad.prepared.batchAccountTotals.size).toBe(0);
+    // 저장된 이번 달 50만원만으로는 급증 아님 (배치 150만원이 잘못 더해지면 2배가 된다)
+    expect(codes(evaluateRisks(batch[0]!, acc('830'), vatOk, bad))).not.toContain('RISK-SPIKE');
+  });
+
+  it('상호·사업자번호가 없는 거래끼리는 같은 가맹점 반복으로 묶지 않는다', () => {
+    const batch = [1, 2, 3].map((i) => mkTx({ merchantName: '', merchantKey: '', approvalNumber: `N${i}`, totalAmount: 11000 + i, supplyAmount: 10000 + i }));
+    const ctx = prepareRiskBatch(ctxOf(batch));
+    expect(codes(evaluateRisks(batch[0]!, acc('830'), vatOk, ctx))).not.toContain('RISK-REPEAT-SAMEDAY');
+  });
+
+  it('카드·현금영수증 매출의 같은 날 같은 금액 반복은 중복·반복 의심이 아니다, 매출 세금계산서는 중복 의심', () => {
+    const sale = (i: number, evidenceType: NormalizedTransaction['evidenceType'] = 'card') =>
+      mkTx({ direction: 'sales', evidenceType, merchantName: '', merchantKey: '', approvalNumber: `S${i}`, supplyAmount: 4091, vatAmount: 409, totalAmount: 4500 });
+    const sales = [1, 2, 3, 4].map((i) => sale(i));
+    const ctx = prepareRiskBatch(ctxOf(sales));
+    const c = codes(evaluateRisks(sales[0]!, acc('401'), vatOk, ctx));
+    expect(c).not.toContain('RISK-DUP-AMOUNT');
+    expect(c).not.toContain('RISK-REPEAT-SAMEDAY');
+
+    const inv = [1, 2].map((i) => mkTx({ direction: 'sales', evidenceType: 'tax_invoice', merchantName: '거래처A', approvalNumber: `T${i}` }));
+    const ctx2 = prepareRiskBatch(ctxOf(inv));
+    expect(codes(evaluateRisks(inv[0]!, acc('401'), vatOk, ctx2))).toContain('RISK-DUP-AMOUNT');
+  });
+
+  it('안내 문구: 파라미터·거래 변수·요일/시각 치환이 정확하다', () => {
+    const t = amt(1200000, { merchantName: '하이마트 강남점', transactionDate: '2026-09-13', rawData: { 승인시간: '23:40:00' } });
+    const fs = risksOf(t, acc('830', '소모품비'));
+    expect(fs.find((x) => x.ruleCode === 'RISK-HIGH-AMOUNT')!.message).toBe('하이마트 강남점 1,200,000원: 고액거래 기준(1,000,000원) 이상입니다.');
+    expect(fs.find((x) => x.ruleCode === 'RISK-ASSET-EXPENSE')!.message).toBe(
+      '소모품비 1,200,000원: 공급가액이 즉시상각 기준(1,000,000원)을 넘습니다. 비품·기계장치 등 자산 계상 여부를 확인하세요.',
+    );
+    const p = risksOf(amt(50000, { merchantName: '올리브영', transactionDate: '2026-09-13', rawData: { 승인시간: '23:40:00' } })).find((x) => x.ruleCode === 'RISK-PERSONAL');
+    expect(p!.message).toBe('올리브영 50,000원 (일요일 23시): 주말·심야 생활업종 결제로 개인사용 가능성이 있습니다.');
+  });
+});

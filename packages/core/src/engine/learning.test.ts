@@ -50,15 +50,23 @@ describe('analyzeCorrections', () => {
       accountName: '상품',
       status: 'suggested',
       origin: 'system_suggested',
-      condition: { field: 'merchantBusinessNumber', op: 'eq', value: BIZ },
-      name: '쿠팡 → 상품',
+      // 매입 거래에만 적용되도록 방향 조건을 함께 건다 (소모품비 → 상품: 수정 전 계정이 비용 → 매입)
+      condition: {
+        all: [
+          { field: 'direction', op: 'eq', value: 'purchase' },
+          { field: 'merchantBusinessNumber', op: 'eq', value: BIZ },
+        ],
+      },
+      name: '쿠팡 (매입) → 상품',
     });
+    expect(s!.direction).toBe('purchase');
     expect(s!.correctionCount).toBe(3);
     expect(s!.transactionIds).toEqual(['t1', 't2', 't3']);
     expect(s!.firstCorrectedAt).toBe(three[0]!.createdAt);
     expect(s!.lastCorrectedAt).toBe(three[2]!.createdAt);
-    // 제안 규칙 조건이 실제 상대방에 매칭된다
-    expect(evaluateCondition(s!.rule.condition, { merchantBusinessNumber: BIZ })).toBe(true);
+    // 제안 규칙 조건이 실제 상대방의 매입에 매칭되고 매출에는 매칭되지 않는다
+    expect(evaluateCondition(s!.rule.condition, { merchantBusinessNumber: BIZ, direction: 'purchase' })).toBe(true);
+    expect(evaluateCondition(s!.rule.condition, { merchantBusinessNumber: BIZ, direction: 'sales' })).toBe(false);
   });
 
   it('does not suggest below the threshold; threshold comes from policy', () => {
@@ -69,7 +77,12 @@ describe('analyzeCorrections', () => {
   it('uses merchantKey condition when no business number is known', () => {
     const list = [1, 2, 3].map((i) => corr(i, { merchantBusinessNumber: null, merchantKey: '동네철물점', before: null, after: '830' }));
     const [s] = analyzeCorrections(list, [], DEFAULT_CONFIDENCE_POLICY);
-    expect(s!.rule.condition).toEqual({ field: 'merchantKey', op: 'eq', value: '동네철물점' });
+    expect(s!.rule.condition).toEqual({
+      all: [
+        { field: 'direction', op: 'eq', value: 'purchase' },
+        { field: 'merchantKey', op: 'eq', value: '동네철물점' },
+      ],
+    });
     expect(s!.suggestionReason).toBe('동일 수정 3회: 미분류 → 소모품비');
   });
 
@@ -176,5 +189,43 @@ describe('buildCorrection', () => {
   it('round-trips into analyzeCorrections', () => {
     const list = [1, 2, 3].map((i) => buildCorrection(before, '146', { ...meta, transactionId: `x${i}`, createdAt: `2026-09-2${i}T00:00:00Z` })!);
     expect(analyzeCorrections(list, [], DEFAULT_CONFIDENCE_POLICY)).toHaveLength(1);
+  });
+
+  it('carries the transaction direction when given, and the suggestion uses it', () => {
+    const unclassified: AccountClassification = { ...before, accountCode: null, accountName: null, source: 'none', confidence: 0 };
+    const list = [1, 2, 3].map(
+      (i) =>
+        buildCorrection(unclassified, '108', {
+          ...meta,
+          tx: { ...meta.tx, direction: 'sales' as const },
+          transactionId: `s${i}`,
+          createdAt: `2026-09-2${i}T00:00:00Z`,
+        })!,
+    );
+    expect(list[0]!.direction).toBe('sales');
+    const [s] = analyzeCorrections(list, [], DEFAULT_CONFIDENCE_POLICY);
+    expect(s!.direction).toBe('sales');
+    expect(s!.rule.name).toBe('쿠팡 (매출) → 외상매출금');
+  });
+});
+
+describe('analyzeCorrections — direction-aware rule overlap', () => {
+  it('a sales-only rule for the same merchant neither blocks nor conflicts with a purchase suggestion', () => {
+    const salesRule = rule({
+      id: 'sales-rule',
+      accountCode: '401',
+      condition: { all: [{ field: 'direction', op: 'eq', value: 'sales' }, { field: 'merchantBusinessNumber', op: 'eq', value: BIZ }] },
+    });
+    const [s] = analyzeCorrections(three, [salesRule], DEFAULT_CONFIDENCE_POLICY);
+    expect(s!.direction).toBe('purchase');
+    expect(s!.conflictingRuleIds).toEqual([]);
+  });
+
+  it('mixed explicit directions leave the rule unscoped and ask for review', () => {
+    const list = [corr(1), corr(2), corr(3)].map((c, i) => ({ ...c, direction: i === 0 ? ('sales' as const) : ('purchase' as const) }));
+    const [s] = analyzeCorrections(list, [], DEFAULT_CONFIDENCE_POLICY);
+    expect(s!.direction).toBeNull();
+    expect(s!.rule.condition).toEqual({ field: 'merchantBusinessNumber', op: 'eq', value: BIZ });
+    expect(s!.suggestionReason).toContain('매입/매출 방향 미확인');
   });
 });

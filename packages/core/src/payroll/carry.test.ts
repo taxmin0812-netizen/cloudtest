@@ -139,3 +139,46 @@ describe('carryForward', () => {
     expect(formatDiffSummary(r.summary)).toBe('변동 없음 2명 / 신규입사 1명 / 퇴사 1명');
   });
 });
+
+describe('carryForward — 리뷰 보완 (무음 손실 방지)', () => {
+  it('전월 동일 직원 지급행 2건 → 1행으로 합산 + 안내 (두 번째 행을 버리지 않음)', () => {
+    const rep = carryForwardWithReport(
+      [prevLine('01'), prevLine('01', { taxablePay: 500_000, nonTaxablePay: 0, grossPay: 500_000, allowances: { 상여: 500_000 }, incomeTax: 20_000, localIncomeTax: 2_000, otherDeductions: 0 })],
+      [master('01')],
+      '2026-09',
+    );
+    expect(rep.lines).toHaveLength(1); // payroll_items (월, 직원) unique
+    expect(rep.lines[0]).toMatchObject({ grossPay: 3_700_000, taxablePay: 3_500_000, incomeTax: 94_350, localIncomeTax: 9_430 });
+    expect(rep.lines[0]!.allowances).toEqual({ 직책수당: 200_000, 식대: 200_000, 상여: 500_000 });
+    expect(rep.notes).toContain('직원01: 전월 지급 2건 합산해 이어받음 — 상여 등 일회성 지급 포함 여부 확인');
+  });
+
+  it('직원 ID 없는 전월 행 → excluded 에 사유 기록', () => {
+    const rep = carryForwardWithReport([prevLine('', { name: '미상' })], [], '2026-09');
+    expect(rep.excluded).toEqual([{ employeeId: '', name: '미상', reason: '직원 ID 없음 — 직원 마스터와 연결 불가' }]);
+  });
+
+  it('소득구분 근로 → 일용 변경: 근로 간이세액을 일용 행에 이어받지 않음', () => {
+    const rep = carryForwardWithReport([prevLine('01', { incomeTax: 50_000, localIncomeTax: 5_000 })], [master('01', { incomeType: 'daily' })], '2026-09');
+    expect(rep.lines[0]).toMatchObject({ incomeType: 'daily', incomeTax: 0, localIncomeTax: 0 });
+    expect(rep.notes).toEqual(expect.arrayContaining([expect.stringContaining('소득구분 근로소득 → 일용근로'), '직원01: 일용직 근무일수 미입력 — 세액 계산 불가']));
+  });
+
+  it('전월 자료가 두 달 전 것이면 지급일을 이번달로 옮기고 안내', () => {
+    const rep = carryForwardWithReport([prevLine('01', { paymentDate: '2026-07-25' })], [master('01')], '2026-09');
+    expect(rep.lines[0]!.paymentDate).toBe('2026-09-25');
+    expect(rep.notes[0]).toContain('직전 달이 아님');
+  });
+
+  it('신규 직원: 과세 수당과 비과세 항목명이 같아도 상세가 덮어써지지 않음', () => {
+    const [l] = carryForward([], [master('02', { allowances: { 식대: 50_000 }, nonTaxable: { 식대: 200_000 } })], '2026-09');
+    expect(l!.allowances).toEqual({ 식대: 50_000, '식대(비과세)': 200_000 });
+    expect(l).toMatchObject({ taxablePay: 2_850_000, nonTaxablePay: 200_000 });
+  });
+
+  it('직원 마스터 중복 → 1행만 생성 + 안내', () => {
+    const rep = carryForwardWithReport([prevLine('01')], [master('01'), master('01')], '2026-09');
+    expect(rep.lines).toHaveLength(1);
+    expect(rep.notes[0]).toContain('직원 마스터 중복');
+  });
+});

@@ -9,7 +9,7 @@ import type { RuleFactField } from '../engine/vat';
  * - 평가 방식: priority 가 높은 규칙부터 조건을 평가해 **처음 일치한 규칙이 결론**을 낸다 (방화벽 규칙과 같은 방식).
  *   나머지 일치 규칙은 참고 근거로만 표시된다. 예외 규칙(전세버스 등)은 원칙 규칙보다 priority 를 높게 둔다.
  * - 우선순위 구간 (관례)
- *   950 이상  데이터 사실 (해외결제, 증빙 없음, 세액 0, 면세 가맹점, 면세사업자, 기업업무추진비) — 사람 규칙(vat_override)으로도 뒤집지 않음
+ *   950 이상  데이터 사실 (해외결제, 증빙 없음, 세액 0, 면세 가맹점, 면세사업자·간이과세자 수임처, 기업업무추진비) — 사람 규칙(vat_override)으로도 뒤집지 않음
  *   800~949  용도·업종 기반 불공제/검토
  *   300      원천자료(홈택스 공제여부결정) 힌트
  *   10~20    증빙별 기본 공제
@@ -182,6 +182,18 @@ export const DEFAULT_VAT_RULES: readonly VatRuleDef[] = Object.freeze<VatRuleDef
     reasonText: '기업업무추진비(접대비) 및 이와 유사한 비용의 매입세액은 공제되지 않습니다.',
     legalBasis: '부가가치세법 제39조①6호, 시행령 제79조',
     confidence: 95,
+    priority: 950,
+  },
+  {
+    // 수임처 과세유형(사실) 규칙 → 950. 같은 priority 에서는 불공제 결론이 먼저라 접대비(VAT-ENT-01)는 그대로 불공제.
+    // 사람 규칙의 vat_override('공제')로 일반과세자식 전액 공제가 자동확정되지 않도록 사실 구간에 둔다.
+    code: 'VAT-SIMP-01',
+    name: '간이과세자(수임처) 매입',
+    condition: all(withVat, f('clientVatType', 'eq', 'simplified')),
+    outcome: 'review',
+    reasonText: '간이과세자 수임처는 매입세액 전액이 아니라 세금계산서등 수취 공급대가의 0.5%를 공제합니다. 처리 방식을 확인하세요.',
+    legalBasis: '부가가치세법 제63조③1호 (WEHAGO 처리방식 검증필요)',
+    confidence: 75,
     priority: 950,
   },
   // ── ② 용도 ──
@@ -397,16 +409,6 @@ export const DEFAULT_VAT_RULES: readonly VatRuleDef[] = Object.freeze<VatRuleDef
     legalBasis: '부가가치세법 제39조①7호',
     confidence: 60,
     priority: 790,
-  },
-  {
-    code: 'VAT-SIMP-01',
-    name: '간이과세자(수임처) 매입',
-    condition: all(withVat, f('clientVatType', 'eq', 'simplified')),
-    outcome: 'review',
-    reasonText: '간이과세자 수임처는 매입세액 전액이 아니라 세금계산서등 수취 공급대가의 0.5%를 공제합니다. 처리 방식을 확인하세요.',
-    legalBasis: '부가가치세법 제63조③1호 (WEHAGO 처리방식 검증필요)',
-    confidence: 75,
-    priority: 700,
   },
   // ── ⑥ 원천 힌트 ──
   {

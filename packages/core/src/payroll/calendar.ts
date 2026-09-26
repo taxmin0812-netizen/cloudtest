@@ -1,5 +1,6 @@
 import type { LocalDate, YearMonth } from '../types';
 import { nextYearMonth, weekdayOf } from '../normalize';
+import { deepFreeze } from './internal';
 
 /**
  * 원천세·간이지급명세서 기한 캘린더.
@@ -27,7 +28,7 @@ export interface HolidayEntry {
  * - 2026-06-03: 제9회 전국동시지방선거일 (공휴일법 제2조 제10호)
  * 검증필요: 정부가 수시 지정하는 임시공휴일은 반영되지 않음 → 관리자가 설정에서 추가해야 한다.
  */
-export const KR_HOLIDAYS: HolidayEntry[] = [
+export const KR_HOLIDAYS: HolidayEntry[] = deepFreeze([
   // 2026
   { date: '2026-01-01', name: '1월 1일' },
   { date: '2026-02-16', name: '설날 전날' },
@@ -76,7 +77,7 @@ export const KR_HOLIDAYS: HolidayEntry[] = [
   { date: '2027-10-11', name: '대체공휴일(한글날)' },
   { date: '2027-12-25', name: '기독탄신일' },
   { date: '2027-12-27', name: '대체공휴일(기독탄신일)' },
-];
+]);
 
 /** 공휴일 목록이 신뢰할 수 있는 범위. 범위 밖 기한은 주말만 보정하고 경고한다. */
 export const KR_HOLIDAY_COVERAGE = { from: '2026-01-01', to: '2027-12-31' } as const;
@@ -229,7 +230,7 @@ export interface CadenceRule {
  * 제출주기 규칙 — 코드가 아니라 데이터로 관리한다 (세법 개정 시 이 배열만 교체).
  * 근거: research 2.5.1, 2.5.2, 4.3
  */
-export const SUBMISSION_CADENCE_RULES: CadenceRule[] = [
+export const SUBMISSION_CADENCE_RULES: CadenceRule[] = deepFreeze([
   {
     id: 'earned_semiannual_until_2026',
     kind: 'earned',
@@ -283,7 +284,7 @@ export const SUBMISSION_CADENCE_RULES: CadenceRule[] = [
     legalBasis: '소득세법 제164조의3 ① 3호, 부칙<제19196호> 제1조 3호',
     status: 'confirmed',
   },
-];
+]);
 
 export function findCadenceRule(
   kind: StatementKind,

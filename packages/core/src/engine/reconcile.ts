@@ -9,7 +9,7 @@ import type {
   Won,
 } from '../types';
 import { addToTotals, emptyTotals, formatWon, totalsEqual } from '../money';
-import { normalizeMerchantName } from '../normalize';
+import { normalizeMerchantName, scrubSensitive } from '../normalize';
 
 // ═══════════════════════════════ 입력 ═══════════════════════════════
 
@@ -113,6 +113,8 @@ interface Unit {
   rowAmountsKnown: boolean;
   category: Category;
   outcome: ReconSourceRow['outcome'] | 'transaction';
+  /** 이 단위가 거래(tx)를 대표하는가. 중복 행이 원래 거래를 가리키는 경우처럼 참조만 하면 false */
+  owns: boolean;
 }
 
 const APPROVED: ReadonlySet<string> = new Set(['approved', 'auto_approved', 'exported', 'reconciled']);
@@ -176,6 +178,11 @@ function subtract(a: AmountTotals, ...bs: AmountTotals[]): AmountTotals {
   return r;
 }
 
+/** 사유 문구(사람 입력·원본 셀 인용)에서 카드번호·주민번호 등을 가린다 */
+function freeText(s: string | null | undefined): string {
+  return s ? scrubSensitive(s.trim()) : '';
+}
+
 const isZero = (t: AmountTotals) => t.count === 0 && t.supplyAmount === 0 && t.vatAmount === 0 && t.totalAmount === 0;
 
 function rowLabel(rows: readonly ReconSourceRow[]): string {
@@ -219,26 +226,43 @@ export function reconcile(input: ReconcileInput): ReconcileResult {
   const txById = new Map(input.transactions.map((t) => [t.id, t] as const));
   const discrepancies: ReconDiscrepancy[] = [];
 
-  // ── 1. 원본 행 → 거래 단위 (여러 행이 한 거래로 묶인 경우 한 단위) ──
+  // ── 1. 원본 행 → 거래 단위 ──
+  // - 정상(ok) 행은 거래별로 묶는다 (세금계산서 품목 여러 줄 → 한 거래).
+  // - 중복·실패 행은 행마다 한 단위. 중복 행의 transactionId 가 '원래 거래'를 가리킬 수도 있으므로
+  //   연결 거래의 상태가 duplicate/failed 일 때만 그 거래를 대표(owns)한다. 그렇지 않으면 원래 거래는 따로 센다.
   const units: Unit[] = [];
   const groups = new Map<string, ReconSourceRow[]>();
+  const owned = new Set<string>();
+  const newUnit = (rows: ReconSourceRow[], outcome: Unit['outcome'], owns: boolean): Unit => ({
+    rows,
+    tx: null,
+    amounts: { supplyAmount: 0, vatAmount: 0, totalAmount: 0 },
+    rowAmountsKnown: false,
+    category: 'pending',
+    outcome,
+    owns,
+  });
   for (const row of input.source.rows) {
-    if (row.outcome !== 'failed' && row.transactionId) {
-      const g = groups.get(row.transactionId);
+    const id = row.transactionId || null;
+    if (row.outcome === 'ok' && id) {
+      const g = groups.get(id);
       if (g) g.push(row);
       else {
         const arr = [row];
-        groups.set(row.transactionId, arr);
-        units.push({ rows: arr, tx: null, amounts: { supplyAmount: 0, vatAmount: 0, totalAmount: 0 }, rowAmountsKnown: false, category: 'pending', outcome: row.outcome });
+        groups.set(id, arr);
+        owned.add(id);
+        units.push(newUnit(arr, 'ok', true));
       }
     } else {
-      units.push({ rows: [row], tx: null, amounts: { supplyAmount: 0, vatAmount: 0, totalAmount: 0 }, rowAmountsKnown: false, category: 'pending', outcome: row.outcome });
+      const t = id ? txById.get(id) : undefined;
+      const owns = !!t && t.status === row.outcome && !owned.has(t.id);
+      if (owns) owned.add(t.id);
+      units.push(newUnit([row], row.outcome, owns));
     }
   }
-  // 원본 행이 없는 거래 (수기 입력 등) → 거래 자체를 원본으로 본다
-  const linked = new Set(groups.keys());
+  // 원본 행이 대표하지 않는 거래 (수기 입력, 이전 자료의 원래 거래 등) → 거래 자체를 원본으로 본다
   for (const t of input.transactions) {
-    if (!linked.has(t.id)) units.push({ rows: [], tx: t, amounts: txAmounts(t), rowAmountsKnown: false, category: 'pending', outcome: 'transaction' });
+    if (!owned.has(t.id)) units.push({ ...newUnit([], 'transaction', true), tx: t, amounts: txAmounts(t) });
   }
 
   // ── 2. 금액 확정 + 분류 ──
@@ -253,10 +277,12 @@ export function reconcile(input: ReconcileInput): ReconcileResult {
   for (const u of units) {
     if (u.outcome !== 'transaction') {
       const id = u.rows[0]!.transactionId;
-      u.tx = u.outcome !== 'failed' && id ? txById.get(id) ?? null : null;
+      const linked = id ? txById.get(id) ?? null : null;
+      // 실패 행은 자신을 나타내는 실패 거래일 때만 연결한다. 금액은 원본 행 값만 쓴다 (해석 실패 금액을 거래 값으로 메우지 않음)
+      u.tx = u.outcome === 'failed' ? (u.owns ? linked : null) : linked;
       const ra = rowAmounts(u.rows);
       u.rowAmountsKnown = ra.known;
-      u.amounts = ra.known || !u.tx ? ra.amounts : txAmounts(u.tx);
+      u.amounts = ra.known || !u.tx || u.outcome === 'failed' ? ra.amounts : txAmounts(u.tx);
     }
     const t = u.tx;
     if (u.outcome === 'failed' || t?.status === 'failed') u.category = 'failed';
@@ -302,7 +328,11 @@ export function reconcile(input: ReconcileInput): ReconcileResult {
       bump(byEvidenceType, ek, 'processed', txAmounts(u.tx));
       bump(byAccount, ak, 'processed', txAmounts(u.tx));
     }
-    if (u.tx && APPROVED.has(u.tx.status) && (u.category === 'export' || u.category === 'pending')) addToTotals(expected, txAmounts(u.tx));
+    if (u.tx && u.owns && (u.category === 'export' || u.category === 'pending')) {
+      if (APPROVED.has(u.tx.status)) addToTotals(expected, txAmounts(u.tx));
+      // 검토 전 거래는 전송파일에 들어가 있어도 검토 대기로 센다
+      else if (UNREVIEWED.has(u.tx.status)) addToTotals(pendingReview, txAmounts(u.tx));
+    }
     if (u.category === 'unexplained') continue;
 
     if (u.category === 'export') {
@@ -324,7 +354,7 @@ export function reconcile(input: ReconcileInput): ReconcileResult {
 
   // 전송파일 행
   const unitByTx = new Map<string, Unit>();
-  for (const u of units) if (u.tx && !unitByTx.has(u.tx.id)) unitByTx.set(u.tx.id, u);
+  for (const u of units) if (u.tx && u.owns && !unitByTx.has(u.tx.id)) unitByTx.set(u.tx.id, u);
   if (fileMode) {
     for (const r of input.exportRows!) {
       const u = r.transactionId ? unitByTx.get(r.transactionId) ?? null : null;
@@ -347,18 +377,18 @@ export function reconcile(input: ReconcileInput): ReconcileResult {
     const base = { transactionId: t?.id, sourceRowNumber: u.rows[0]?.rowNumber, date: t?.transactionDate ?? u.rows[0]?.date ?? undefined, merchantName: t?.merchantName ?? u.rows[0]?.merchantName ?? undefined, amount: u.amounts.totalAmount };
     switch (u.category) {
       case 'duplicate': {
-        const reason = t?.duplicateReason;
+        const reason = freeText(t?.duplicateReason);
         discrepancies.push({ kind: 'duplicate_excluded', ...base, blocking: false, message: `${describe(u)} 거래가 중복판정으로 제외되었습니다.${reason ? ` 사유: ${reason}` : ''}` });
         break;
       }
       case 'excluded': {
-        const reason = t?.excludedReason;
+        const reason = freeText(t?.excludedReason);
         discrepancies.push({ kind: 'user_excluded', ...base, blocking: false, message: `${describe(u)} 거래가 사용자에 의해 제외되었습니다.${reason ? ` 사유: ${reason}` : ' (제외 사유 미기재)'}` });
         break;
       }
       case 'failed': {
         const r0 = u.rows[0];
-        const reason = r0?.errorReason?.trim() || '알 수 없는 오류로 수집 실패';
+        const reason = freeText(r0?.errorReason) || '알 수 없는 오류로 수집 실패';
         const label = r0 ? `${rowLabel(u.rows)}: ` : `${describe(u)}: `;
         const tail = /실패/.test(reason) ? '' : ' (수집 실패)';
         const amt = u.rowAmountsKnown ? ` — 합계 ${formatWon(u.amounts.totalAmount)}` : '';
@@ -379,7 +409,6 @@ export function reconcile(input: ReconcileInput): ReconcileResult {
               : `${describe(u)} 거래가 전송완료 상태이나 이번 전송파일에 없습니다.`,
           });
         }
-        if (t && UNREVIEWED.has(t.status)) addToTotals(pendingReview, txAmounts(t));
         break;
       default:
         break;
@@ -535,7 +564,7 @@ function compareWehago(input: ReconcileInput, units: readonly Unit[], fileMode: 
 
   // 비교 기준 = 전송파일 행 (전송 전이면 전송준비 거래)
   interface Item { date: string; merchantName: string; a: Amounts; accountCode: string | null; transactionId?: string }
-  const unitByTx = new Map(units.filter((u) => u.tx).map((u) => [u.tx!.id, u] as const));
+  const unitByTx = new Map(units.filter((u) => u.tx && u.owns).map((u) => [u.tx!.id, u] as const));
   const items: Item[] = fileMode
     ? input.exportRows!.map((r) => {
         const t = r.transactionId ? unitByTx.get(r.transactionId)?.tx ?? null : null;
@@ -567,9 +596,14 @@ function compareWehago(input: ReconcileInput, units: readonly Unit[], fileMode: 
 
   const out: ReconDiscrepancy[] = [];
   const label = (date: string, m: string, total: Won) => [date, m, formatWon(total)].filter(Boolean).join(' ');
-  for (const it of items) {
-    const a = `${it.date}|${it.a.totalAmount}`;
-    const idx = take(k1.get(`${a}|${normalizeMerchantName(it.merchantName)}`)) ?? take(k2.get(a));
+  // 1차(상호 일치)를 전부 끝낸 뒤 2차(일자+합계)를 한다 — 앞 거래가 뒤 거래의 정확한 짝을 가로채지 않도록
+  const dateAmt = (it: Item) => `${it.date}|${it.a.totalAmount}`;
+  const matchOf = items.map((it) => take(k1.get(`${dateAmt(it)}|${normalizeMerchantName(it.merchantName)}`)));
+  items.forEach((it, j) => {
+    if (matchOf[j] === null) matchOf[j] = take(k2.get(dateAmt(it)));
+  });
+  for (const [j, it] of items.entries()) {
+    const idx = matchOf[j] ?? null;
     const base = { transactionId: it.transactionId, date: it.date || undefined, merchantName: it.merchantName || undefined, amount: it.a.totalAmount };
     if (idx === null) {
       out.push({ kind: 'missing_in_wehago', ...base, blocking: true, message: `${label(it.date, it.merchantName, it.a.totalAmount)} 거래가 WEHAGO에 반영되지 않았습니다.` });

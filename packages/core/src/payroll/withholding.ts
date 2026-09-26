@@ -1,5 +1,6 @@
 import type { IncomeType, LocalDate, PayrollLine, RiskSeverity, Won } from '../types';
-import { formatWon } from '../money';
+import { assertWon, formatWon } from '../money';
+import { deepFreeze } from './internal';
 
 /**
  * 원천징수 세액 계산·검증 (순수 함수).
@@ -98,7 +99,8 @@ export interface EarnedRoughParams {
   standardTaxCredit: Won;
 }
 
-export const WITHHOLDING_PARAMS: WithholdingParams = {
+/** 법정 기본값. 동결되어 있으므로 변경은 resolveWithholdingParams(override) 로만 한다 */
+export const WITHHOLDING_PARAMS: WithholdingParams = deepFreeze({
   localIncomeTaxRate: 0.1,
   smallAmountThreshold: 1_000,
   incomeTaxTruncateUnit: 10,
@@ -153,7 +155,7 @@ export const WITHHOLDING_PARAMS: WithholdingParams = {
       standardTaxCredit: 130_000,
     },
   },
-};
+});
 
 /** 부분 덮어쓰기용 (DB settings 등) */
 export type WithholdingParamsOverride = {
@@ -184,9 +186,9 @@ function toPpm(rate: number): bigint {
   return BigInt(Math.round(rate * 1_000_000));
 }
 
-/** amount × rate 를 원 미만 절사 (부동소수 오차 없이 BigInt 로 계산) */
+/** amount × rate 를 원 미만 절사 (부동소수 오차 없이 BigInt 로 계산). 정수가 아닌 금액은 오류 */
 export function applyRate(amount: Won, rate: number): Won {
-  return Number((BigInt(amount) * toPpm(rate)) / PPM);
+  return Number((BigInt(assertWon(amount, '금액')) * toPpm(rate)) / PPM);
 }
 
 /** unit 미만 절사 (0 방향). unit 1 이면 그대로 */
@@ -265,7 +267,13 @@ export function computeBusinessWithholding(amount: Won, opts: BusinessWithholdin
 
 // ────────────────────────────── 일용근로 ──────────────────────────────
 
-export type DailyWageInput = { dailyWages: Won[] } | { dailyWage: Won; workDays: number };
+/** 일당별 근무일수 묶음 (같은 일당이 여러 날이면 1건으로) */
+export interface DailyWageGroup {
+  dailyWage: Won;
+  days: number;
+}
+
+export type DailyWageInput = { dailyWages: Won[] } | { dailyWage: Won; workDays: number } | { wageGroups: DailyWageGroup[] };
 
 /** 1일분 원천징수세액 정확값 (단위: 1e-12원, BigInt — 부동소수 오차 없음) */
 function dailyTaxExactPpm2(taxable: Won, p: WithholdingParams): bigint {
@@ -273,30 +281,54 @@ function dailyTaxExactPpm2(taxable: Won, p: WithholdingParams): bigint {
   return BigInt(taxable) * toPpm(p.daily.incomeTaxRate) * (PPM - toPpm(p.daily.taxCreditRatio));
 }
 
+function assertWorkDays(days: number): number {
+  if (!Number.isSafeInteger(days) || days < 0) {
+    throw new Error(`근무일수는 0 이상의 정수여야 합니다: ${days}`);
+  }
+  return days;
+}
+
+/** 입력 형태를 일당별 묶음으로 정규화 (근무일수만큼 배열을 만들지 않는다) */
+function toWageGroups(input: DailyWageInput): DailyWageGroup[] {
+  const groups = new Map<Won, number>();
+  const add = (wage: Won, days: number) => {
+    assertWon(wage, '일당');
+    assertWorkDays(days);
+    if (days > 0) groups.set(wage, (groups.get(wage) ?? 0) + days);
+  };
+  if ('dailyWages' in input) for (const w of input.dailyWages) add(w, 1);
+  else if ('wageGroups' in input) for (const g of input.wageGroups) add(g.dailyWage, g.days);
+  else add(input.dailyWage, input.workDays);
+  return [...groups].map(([dailyWage, days]) => ({ dailyWage, days }));
+}
+
 /**
  * 일용근로소득 원천징수.
  * 일별: (일당 − 150,000) × 6% × (1 − 55%) = 2.7% → 일별 합산 → 소액부징수(합계 1,000원 미만) → 10원 미만 절사.
  * 일괄지급 시 일별 세액 합계로 소액부징수 판단 (국세청 해석 법인46013-343).
+ * 근무일수는 0 이상의 정수만 허용한다 (소수 입력은 조용히 버리지 않고 오류).
  */
 export function computeDailyWorkerWithholding(input: DailyWageInput, override?: WithholdingParamsOverride): DailyWithholdingResult {
   const p = resolveWithholdingParams(override);
-  const wages = 'dailyWages' in input ? input.dailyWages : Array.from({ length: Math.max(0, input.workDays) }, () => input.dailyWage);
-  const groups = new Map<Won, number>();
-  for (const w of wages) groups.set(w, (groups.get(w) ?? 0) + 1);
+  const groups = toWageGroups(input);
 
   const SCALE = PPM * PPM;
   let sumExact = 0n; // ppm² 단위
+  let workDays = 0;
+  let totalWage = 0;
   const perDay: DailyWithholdingResult['perDay'] = [];
-  for (const [dailyWage, days] of groups) {
+  for (const { dailyWage, days } of groups) {
     const taxable = Math.max(0, dailyWage - p.daily.dailyDeduction);
     const exact = dailyTaxExactPpm2(taxable, p);
     const perDayScaled = p.daily.perDayRounding === 'won' ? (exact / SCALE) * SCALE : exact;
     sumExact += perDayScaled * BigInt(days);
-    perDay.push({ dailyWage, days, taxablePerDay: taxable, taxPerDay: Number(perDayScaled) / Number(SCALE) });
+    workDays += days;
+    totalWage += dailyWage * days;
+    // 표시용 1일 세액 (소수 2자리까지; 'won' 설정이면 정수)
+    perDay.push({ dailyWage, days, taxablePerDay: taxable, taxPerDay: Number((perDayScaled * 100n) / SCALE) / 100 });
   }
   const summed = Number(sumExact / SCALE);
   const computed = truncateToUnit(summed, p.incomeTaxTruncateUnit);
-  const totalWage = wages.reduce((a, b) => a + b, 0);
 
   const basis: string[] = perDay.map(
     (d) =>
@@ -319,7 +351,7 @@ export function computeDailyWorkerWithholding(input: DailyWageInput, override?: 
     computedIncomeTax: computed,
     smallAmountExempted: exempted,
     basis,
-    workDays: wages.length,
+    workDays,
     totalWage,
     perDay,
   };
@@ -338,9 +370,13 @@ export interface WithholdingIssue {
     | 'tax_without_pay'
     | 'negative_tax'
     | 'daily_missing_days'
+    | 'daily_invalid_days'
+    | 'daily_days_exceed_month'
     | 'daily_uneven_wage'
     | 'gross_mismatch'
     | 'business_non_taxable'
+    | 'invalid_amount'
+    | 'earned_tax_zero'
     | 'rough_estimate_gap';
   severity: RiskSeverity;
   message: string;
@@ -362,21 +398,50 @@ export interface LineWithholdingOptions {
 }
 
 /**
- * 일용직 급여행에서 일별 일당 배열을 복원한다.
- * 과세급여가 근무일수로 나누어떨어지지 않으면 1원 차이로 배분(근사)하고 경고한다.
+ * 일용직 급여행에서 일당별 근무일수 묶음을 복원한다 (근무일수만큼 배열을 만들지 않음).
+ * 과세급여가 근무일수로 나누어떨어지지 않으면 1원 차이로 배분(근사)하고 even=false.
+ * 한계: 급여행에는 일별 지급내역이 없으므로 "매일 같은 일당"으로 가정한다.
+ *       일당이 15만원 미만인 날과 초과인 날이 섞이면 실제 세액보다 적게 계산될 수 있다 → WEHAGO 값과 대조.
  */
-export function dailyWagesOfLine(line: Pick<PayrollLine, 'taxablePay' | 'workDays'>): { wages: Won[]; even: boolean } | null {
+export function dailyWageGroupsOfLine(line: Pick<PayrollLine, 'taxablePay' | 'workDays'>): { groups: DailyWageGroup[]; even: boolean } | null {
   const days = line.workDays ?? 0;
-  if (!Number.isInteger(days) || days <= 0) return null;
+  if (!Number.isSafeInteger(days) || days <= 0 || !Number.isSafeInteger(line.taxablePay)) return null;
   const q = Math.floor(line.taxablePay / days);
   const r = line.taxablePay - q * days;
-  const wages = Array.from({ length: days }, (_, i) => (i < r ? q + 1 : q));
-  return { wages, even: r === 0 };
+  const groups: DailyWageGroup[] = [];
+  if (r > 0) groups.push({ dailyWage: q + 1, days: r });
+  if (days - r > 0) groups.push({ dailyWage: q, days: days - r });
+  return { groups, even: r === 0 };
+}
+
+/** 일용직 급여행의 일별 일당 배열 (표시·테스트용). 계산에는 dailyWageGroupsOfLine 사용 */
+export function dailyWagesOfLine(line: Pick<PayrollLine, 'taxablePay' | 'workDays'>): { wages: Won[]; even: boolean } | null {
+  const g = dailyWageGroupsOfLine(line);
+  if (!g) return null;
+  const wages: Won[] = [];
+  for (const { dailyWage, days } of g.groups) for (let i = 0; i < days; i++) wages.push(dailyWage);
+  return { wages, even: g.even };
+}
+
+/** 한 달 최대 근무일수 — 이를 넘으면 지급기간·입력 오류 의심 */
+const MAX_DAYS_PER_MONTH = 31;
+
+const MONEY_FIELDS = ['taxablePay', 'nonTaxablePay', 'grossPay', 'incomeTax', 'localIncomeTax'] as const;
+
+/** 원 단위 정수가 아닌 금액 필드 목록 */
+export function invalidMoneyFields(line: PayrollLine): string[] {
+  return MONEY_FIELDS.filter((f) => !Number.isSafeInteger(line[f]));
 }
 
 /** 급여행 1건의 원천세 계산 (사업·일용: 계산, 근로: 입력값 유지 + 지방세 재계산) */
 export function computeLineWithholding(line: PayrollLine, opts: LineWithholdingOptions = {}): LineWithholding {
   const issues: WithholdingIssue[] = [];
+  const bad = invalidMoneyFields(line);
+  if (bad.length) {
+    // 계산하지 않고 입력값 유지 + high (예외로 전체 배치를 중단시키지 않는다)
+    issues.push({ code: 'invalid_amount', severity: 'high', message: `원 단위 정수가 아닌 금액: ${bad.join(', ')} — 원천 데이터 확인` });
+    return { incomeTax: line.incomeTax, localIncomeTax: line.localIncomeTax, source: 'unavailable', basis: [], issues };
+  }
   if (line.taxablePay + line.nonTaxablePay !== line.grossPay) {
     issues.push({
       code: 'gross_mismatch',
@@ -397,13 +462,25 @@ export function computeLineWithholding(line: PayrollLine, opts: LineWithholdingO
       return { incomeTax: r.incomeTax, localIncomeTax: r.localIncomeTax, source: 'calculated', basis: r.basis, issues };
     }
     case 'daily': {
-      const d = dailyWagesOfLine(line);
+      const days = line.workDays;
+      if (days !== undefined && days !== null && (!Number.isSafeInteger(days) || days < 0)) {
+        issues.push({ code: 'daily_invalid_days', severity: 'high', message: `일용직 근무일수(${days})가 0 이상의 정수가 아님 — 세액 계산 불가` });
+        return { incomeTax: line.incomeTax, localIncomeTax: line.localIncomeTax, source: 'unavailable', basis: [], issues };
+      }
+      const d = dailyWageGroupsOfLine(line);
       if (!d) {
         if (line.taxablePay > 0) {
           issues.push({ code: 'daily_missing_days', severity: 'high', message: '일용직 근무일수가 없어 세액을 계산할 수 없습니다' });
           return { incomeTax: line.incomeTax, localIncomeTax: line.localIncomeTax, source: 'unavailable', basis: [], issues };
         }
         return { incomeTax: 0, localIncomeTax: 0, source: 'calculated', basis: ['지급액 0원 — 원천징수 없음'], issues };
+      }
+      if (days! > MAX_DAYS_PER_MONTH) {
+        issues.push({
+          code: 'daily_days_exceed_month',
+          severity: 'warning',
+          message: `근무일수 ${days}일 — 한 달 ${MAX_DAYS_PER_MONTH}일 초과, 지급기간·입력값 확인`,
+        });
       }
       if (!d.even) {
         issues.push({
@@ -412,8 +489,14 @@ export function computeLineWithholding(line: PayrollLine, opts: LineWithholdingO
           message: `과세급여 ${formatWon(line.taxablePay)}가 근무일수 ${line.workDays}일로 나누어떨어지지 않음 — 일별 지급내역 확인`,
         });
       }
-      const r = computeDailyWorkerWithholding({ dailyWages: d.wages }, opts.params);
-      return { incomeTax: r.incomeTax, localIncomeTax: r.localIncomeTax, source: 'calculated', basis: r.basis, issues };
+      const r = computeDailyWorkerWithholding({ wageGroups: d.groups }, opts.params);
+      return {
+        incomeTax: r.incomeTax,
+        localIncomeTax: r.localIncomeTax,
+        source: 'calculated',
+        basis: [...r.basis, '가정: 근무일마다 같은 일당 (일별 지급내역이 다르면 WEHAGO 값과 대조)'],
+        issues,
+      };
     }
     case 'earned':
     default: {
@@ -492,6 +575,10 @@ export function validateEarnedWithholding(
   if (line.incomeType !== 'earned') return [];
   const p = resolveWithholdingParams(opts.params);
   const issues: WithholdingIssue[] = [];
+  const bad = invalidMoneyFields(line);
+  if (bad.length) {
+    return [{ code: 'invalid_amount', severity: 'high', message: `원 단위 정수가 아닌 금액: ${bad.join(', ')} — 원천 데이터 확인` }];
+  }
 
   if (line.incomeTax < 0) {
     issues.push({ code: 'negative_tax', severity: 'warning', message: `소득세가 음수(${formatWon(line.incomeTax)}) — 환급/정산분 여부 확인` });
@@ -501,7 +588,11 @@ export function validateEarnedWithholding(
   }
   issues.push(...checkLocalTax(line.incomeTax, line.localIncomeTax, opts.params));
 
-  if (prevLine && prevLine.incomeType === 'earned') {
+  // 과세급여가 있는데 소득세 0원 (신규입사자 초안 등 간이세액 미반영 가능) — 검증용 추정이 소액부징수 기준 이상일 때만
+  const zeroTaxIssue = earnedZeroTaxIssue(line, { dependents: opts.dependents, params: opts.params });
+  if (zeroTaxIssue) issues.push(zeroTaxIssue);
+
+  if (prevLine && prevLine.incomeType === 'earned' && invalidMoneyFields(prevLine).length === 0) {
     const payDelta = line.taxablePay - prevLine.taxablePay;
     const taxDelta = line.incomeTax - prevLine.incomeTax;
     const payText = `과세급여 ${formatWon(prevLine.taxablePay)} → ${formatWon(line.taxablePay)}`;
@@ -529,7 +620,7 @@ export function validateEarnedWithholding(
     }
   }
 
-  if (opts.useRoughEstimate && line.taxablePay > 0) {
+  if (opts.useRoughEstimate && line.taxablePay > 0 && !zeroTaxIssue) {
     const est = estimateEarnedIncomeTaxRough(line.taxablePay, { dependents: opts.dependents, params: opts.params });
     const gap = Math.abs(est.incomeTax - line.incomeTax);
     const base = Math.max(est.incomeTax, line.incomeTax);
@@ -632,6 +723,26 @@ export function estimateEarnedIncomeTaxRough(
       standardTaxCredit: standard,
       annualTax,
     },
+  };
+}
+
+/**
+ * 근로소득 과세급여 > 0 인데 소득세 0원이고, 검증용 추정 세액이 소액부징수 기준(1,000원) 이상이면 warning.
+ * 부양가족이 많으면 실제 간이세액이 0원일 수 있으므로 dependents 를 넘기면 오탐이 줄어든다.
+ */
+export function earnedZeroTaxIssue(
+  line: Pick<PayrollLine, 'incomeType' | 'taxablePay' | 'incomeTax'>,
+  opts: { dependents?: number; params?: WithholdingParamsOverride } = {},
+): WithholdingIssue | null {
+  if (line.incomeType !== 'earned' || line.incomeTax !== 0 || !(line.taxablePay > 0) || !Number.isSafeInteger(line.taxablePay)) return null;
+  const p = resolveWithholdingParams(opts.params);
+  const est = estimateEarnedIncomeTaxRough(line.taxablePay, opts);
+  if (est.incomeTax < p.smallAmountThreshold) return null;
+  const dependents = Math.max(1, Math.trunc(opts.dependents ?? 1));
+  return {
+    code: 'earned_tax_zero',
+    severity: 'warning',
+    message: `과세급여 ${formatWon(line.taxablePay)}인데 소득세 0원 — WEHAGO 간이세액 반영 여부 확인 (${est.label} ${formatWon(est.incomeTax)}, 부양가족 ${dependents}명 기준)`,
   };
 }
 

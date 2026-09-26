@@ -317,3 +317,58 @@ describe('timingSafeEqualString', () => {
     expect(timingSafeEqualString('', '')).toBe(true);
   });
 });
+
+describe('blindIndex — 마스킹·자릿수 오류 거부 (동일인 오판 방지)', () => {
+  const key = randomBytes(32);
+  /** 사용자 안내 문구(userMessage) — toThrow(regex) 는 내부 message 만 본다 */
+  const userMsg = (fn: () => unknown): string => {
+    try {
+      fn();
+    } catch (e) {
+      expect(e).toBeInstanceOf(ValidationError);
+      return (e as ValidationError).userMessage;
+    }
+    return '(예외 없음)';
+  };
+
+  it('마스킹된 주민번호·계좌번호는 거부 (숫자만 남기면 다른 사람과 해시가 겹친다)', () => {
+    expect(() => blindIndex('900101-1******', 'rrn', key)).toThrow(ValidationError);
+    expect(userMsg(() => blindIndex('900101-1●●●●●●', 'rrn', key))).toContain('마스킹된 번호');
+    expect(() => blindIndex('110-***-456789', 'bank_account', key)).toThrow(ValidationError);
+    expect(() => blindIndex('123-45-*****', 'business_number', key)).toThrow(ValidationError);
+  });
+
+  it('주민번호 13자리·사업자번호 10자리가 아니면 거부', () => {
+    expect(userMsg(() => blindIndex('9001011', 'rrn', key))).toContain('13자리');
+    expect(userMsg(() => blindIndex('900101-12345678', 'rrn', key))).toContain('13자리');
+    expect(userMsg(() => blindIndex('123-45-6789', 'business_number', key))).toContain('10자리');
+    expect(blindIndex('123-45-67890', 'business_number', key)).toBe(blindIndex('1234567890', 'business_number', key));
+  });
+
+  it('계좌·전화는 6자리 미만이면 거부, 정상 번호는 표기와 무관하게 동일', () => {
+    expect(userMsg(() => blindIndex('12-345', 'bank_account', key))).toContain('너무 짧습니다');
+    expect(blindIndex('110-123-456789', 'bank_account', key)).toBe(blindIndex('110123456789', 'bank_account', key));
+    expect(blindIndex('010-1234-5678', 'phone', key)).toBe(blindIndex('01012345678', 'phone', key));
+  });
+
+  it('숫자형이 아닌 용도는 자릿수 검사를 하지 않는다', () => {
+    expect(blindIndex('a*b@office.kr', 'email', key)).toMatch(/^[0-9a-f]{64}$/);
+  });
+});
+
+describe('assertSecurityConfig — 운영 쿠키 설정', () => {
+  const prod = { NODE_ENV: 'production', MINTAX_DATA_KEY: b64(k1), MINTAX_INDEX_KEY: b64(k2) };
+
+  it('운영에서 COOKIE_SECURE=false 면 경고 (시작은 막지 않음)', () => {
+    const { warnings } = assertSecurityConfig({ ...prod, COOKIE_SECURE: 'false' });
+    expect(warnings).toHaveLength(1);
+    expect(warnings[0]).toContain('COOKIE_SECURE=true');
+  });
+
+  it('운영 COOKIE_SECURE=true·미설정, 개발 COOKIE_SECURE=false 는 쿠키 경고 없음', () => {
+    expect(assertSecurityConfig({ ...prod, COOKIE_SECURE: 'true' }).warnings).toEqual([]);
+    expect(assertSecurityConfig(prod).warnings).toEqual([]);
+    const dev = assertSecurityConfig({ MINTAX_DATA_KEY: b64(k1), MINTAX_INDEX_KEY: b64(k2), COOKIE_SECURE: 'false' });
+    expect(dev.warnings).toEqual([]);
+  });
+});

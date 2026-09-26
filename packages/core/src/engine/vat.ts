@@ -85,16 +85,47 @@ function compactPlate(s: string): string {
   return s.normalize('NFKC').replace(/[\s-]/g, '').toUpperCase();
 }
 
-/** 수임처 불공제 차량번호가 적요·상호·원본 행 문자열 값에 등장하는가 */
+/**
+ * 수임처 불공제 차량번호가 적요·상호·원본 행 문자열 값에 등장하는가.
+ * - 한글이 들어간 정식 번호('12가3456')는 공백·하이픈을 무시하고 원본 행까지 찾는다.
+ * - 숫자만 등록된 번호(뒷 4자리 등)는 승인번호·금액·카드번호에 우연히 섞이므로
+ *   적요·상호에서 앞뒤가 숫자가 아닌 독립된 숫자열일 때만 인정한다.
+ */
 export function matchesClientVehicle(tx: Pick<NormalizedTransaction, 'description' | 'merchantName' | 'rawData'>, vehicles: readonly string[]): boolean {
   if (!vehicles || vehicles.length === 0) return false;
-  const parts: string[] = [tx.description ?? '', tx.merchantName ?? ''];
-  if (tx.rawData) for (const v of Object.values(tx.rawData)) if (typeof v === 'string') parts.push(v);
-  const hay = compactPlate(parts.join('|'));
+  let hay: string | null = null;
+  let free: string | null = null;
   return vehicles.some((p) => {
     const k = compactPlate(p);
-    return k.length >= 4 && hay.includes(k);
+    if (k.length < 4) return false;
+    if (/^\d+$/.test(k)) {
+      free ??= `${tx.description ?? ''} ${tx.merchantName ?? ''}`.normalize('NFKC');
+      let i = free.indexOf(k);
+      while (i >= 0) {
+        if (!/\d/.test(free[i - 1] ?? '') && !/\d/.test(free[i + k.length] ?? '')) return true;
+        i = free.indexOf(k, i + 1);
+      }
+      return false;
+    }
+    if (hay === null) {
+      const parts: string[] = [tx.description ?? '', tx.merchantName ?? ''];
+      if (tx.rawData) for (const v of Object.values(tx.rawData)) if (typeof v === 'string') parts.push(v);
+      hay = compactPlate(parts.join('|'));
+    }
+    return hay.includes(k);
   });
+}
+
+// 일자별 요일 메모 (1만 건 배치에서도 일자 종류는 수십 개) — 크기 상한을 두어 장기 실행 프로세스에서도 무한 증가 방지
+const weekdayMemo = new Map<string, number>();
+function cachedWeekday(date: string): number {
+  let w = weekdayMemo.get(date);
+  if (w === undefined) {
+    if (weekdayMemo.size >= 4096) weekdayMemo.clear();
+    w = weekdayOf(date);
+    weekdayMemo.set(date, w);
+  }
+  return w;
 }
 
 /** 거래 + 계정 결과 + 수임처 → 규칙 평가용 사실(facts) */
@@ -122,7 +153,7 @@ export function buildRuleFacts(
     cardNumberMasked: tx.cardNumberMasked,
     isForeign: tx.isForeign,
     currency: tx.currency,
-    weekday: validDate ? weekdayOf(date) : null,
+    weekday: validDate ? cachedWeekday(date) : null,
     dayOfMonth: validDate ? Number(date.slice(8, 10)) : null,
     accountCode: account?.accountCode ?? null,
     accountName: account?.accountName ?? null,
@@ -459,6 +490,13 @@ export function classifyVat(tx: NormalizedTransaction, account: AccountClassific
     if (ov.ruleId) ruleIds.unshift(ov.ruleId);
     if (!deductible) reasonCode = ov.reasonCode ?? ov.ruleId ?? null;
     for (const r of matched) reasons.push(`참고: ${ruleLine(r)}`);
+    // 사람 규칙은 가맹점 단위 일반 규칙이고 원천 힌트는 이 거래 한 건의 자료다 → '공제' 지정 ↔ 원천 '불공제'면 검토
+    if (deductible === true && tx.sourceDeductibleHint === false) {
+      deductible = null;
+      confidence = Math.min(confidence, opt.hintConflictMaxConfidence);
+      summary = '검토 필요 — 승인된 규칙(공제)과 원천자료 공제여부(불공제)가 다릅니다';
+      reasons.push('원천자료(홈택스)는 이 거래를 불공제로 표시했습니다. 가맹점 과세유형·업종이 바뀌었는지 확인하세요.');
+    }
   } else if (!primary) {
     deductible = null;
     confidence = opt.noRuleConfidence;

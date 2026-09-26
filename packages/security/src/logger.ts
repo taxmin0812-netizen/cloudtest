@@ -28,7 +28,11 @@ const MAX_STRING = 8_000;
 export function scrubText(text: string): string {
   let s = scrubSensitive(text);
   // 주민(외국인)등록번호: 앞 6자리+성별자리만 남김 (maskResidentNumber 와 동일 형태)
-  s = s.replace(/(?<![0-9A-Za-z])(\d{6})[-\s]?([1-8])\d{6}(?!\d)/g, '$1-$2******');
+  // 엑셀 원본에서 흔한 전각 숫자(９００１０１)·전각/유니코드 하이픈(－, –, —)도 포함
+  s = s.replace(
+    /(?<![0-9０-９A-Za-z])([0-9０-９]{6})[-\s\u2010-\u2015\u2212\uFF0D]?([1-8１-８])[0-9０-９]{6}(?![0-9０-９])/g,
+    '$1-$2******',
+  );
   // 카드번호 16자리
   s = s.replace(/(?<!\d)(\d{4})[-\s]?\d{4}[-\s]?\d{4}[-\s]?(\d{4})(?!\d)/g, '$1-****-****-$2');
   // Authorization 헤더 값
@@ -80,7 +84,17 @@ const SENSITIVE_KEY_EXACT = new Set(['rrn', 'ssn', 'otp', 'pin', 'cvc', 'cvv', '
 /** 마스킹된 값(끝이 masked)은 이미 안전한 형태 → 키 차단 대신 패턴 스크럽만 */
 const SAFE_SUFFIXES = ['masked'];
 
+/**
+ * 엑셀 원본 행(rawData)의 한글 헤더 — 괄호·기호를 뺀 뒤 부분 일치로 차단.
+ * '주민(외국인)등록번호', '주민/사업자번호' 처럼 괄호·슬래시가 끼어도 잡도록 '주민' 으로 시작하는 헤더는 모두 차단하되
+ * 세목 '주민세' 는 제외한다. '입금계좌' 처럼 '계좌'로 끝나는 헤더도 계좌번호로 본다.
+ */
+const SENSITIVE_KEY_KO = /주민(?!세)|외국인등록|외국인번호|실명번호|비밀번호|암호|계좌번호|계좌$|카드번호|여권번호|면허번호|인증서|보안코드/;
+
 export function isSensitiveKey(key: string): boolean {
+  const ko = key.normalize('NFKC').replace(/[^\p{L}\p{N}]/gu, '');
+  if (ko.endsWith('마스킹')) return false;
+  if (SENSITIVE_KEY_KO.test(ko)) return true;
   const k = key.toLowerCase().replace(/[^a-z0-9]/g, '');
   if (k === '') return false;
   if (SAFE_SUFFIXES.some((s) => k.endsWith(s))) return false;
@@ -139,6 +153,20 @@ export function serializeError(err: unknown, seen: WeakSet<object> = new WeakSet
   return out;
 }
 
+/**
+ * 엑셀은 하이픈 없는 주민번호·카드번호를 숫자 셀로 준다 (예: 9001011234567).
+ * 13자리 이상(≥1e12) 정수는 문자열로 바꿔 패턴 스크럽 → 걸리면 마스킹 문자열, 아니면 숫자 그대로.
+ */
+function sanitizeNumber(value: number): number | string {
+  if (!Number.isFinite(value)) return String(value);
+  if (Number.isInteger(value) && Math.abs(value) >= 1e12) {
+    const s = value.toLocaleString('en-US', { useGrouping: false, maximumFractionDigits: 0 });
+    const scrubbed = scrubText(s);
+    if (scrubbed !== s) return scrubbed;
+  }
+  return value;
+}
+
 function safeString(v: unknown): string {
   try {
     return String(v);
@@ -153,11 +181,11 @@ function sanitize(value: unknown, seen: WeakSet<object>, depth: number): unknown
     case 'string':
       return truncate(scrubText(value));
     case 'number':
-      return Number.isFinite(value) ? value : String(value);
+      return sanitizeNumber(value);
     case 'boolean':
       return value;
     case 'bigint':
-      return value.toString();
+      return scrubText(value.toString());
     case 'symbol':
       return value.toString();
     case 'function':
@@ -228,7 +256,13 @@ function sanitizeEntries(entries: Array<[string, unknown]>, seen: WeakSet<object
       break;
     }
     const key = scrubText(k);
-    out[key] = shouldRedact(k, v) ? REDACTED : sanitize(v, seen, depth + 1);
+    // '__proto__' 키(JSON.parse 결과 등)는 대입하면 프로토타입이 바뀌어 로그에서 사라진다 → 고유 속성으로 정의
+    Object.defineProperty(out, key, {
+      value: shouldRedact(k, v) ? REDACTED : sanitize(v, seen, depth + 1),
+      enumerable: true,
+      writable: true,
+      configurable: true,
+    });
   }
   return out;
 }

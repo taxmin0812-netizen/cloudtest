@@ -33,7 +33,7 @@ erDiagram
   import_jobs |o--o{ transactions : "생성"
   transactions ||--o{ classification_results : "엔진 판단 이력"
   transactions ||--o{ classification_corrections : "사람 수정"
-  clients ||--o{ mapping_rules : "계정 규칙"
+  clients |o--o{ mapping_rules : "계정 규칙(null = 공통)"
   clients |o--o{ vat_rules : "부가세 규칙(override)"
   clients |o--o{ review_rules : "위험 규칙(override)"
   clients ||--o{ export_jobs : "WEHAGO 전송"
@@ -720,7 +720,7 @@ erDiagram
 | 동작 | FK | 의도 |
 |---|---|---|
 | **RESTRICT** | `transactions.client_id`, `import_jobs.client_id`, `export_jobs.client_id`, `reconciliation_jobs.client_id`, `payroll_items.employee_id` | 장부·전송·대사 이력이 있는 수임처와 급여 이력이 있는 직원은 물리 삭제할 수 없다. 대신 `clients.active`, `employees.active`를 `false`로 바꾼다(데이터 삭제 금지 원칙) |
-| **CASCADE** | `sessions.user_id`, `client_business_profiles.client_id`, `transaction_sources.import_job_id`, `classification_results.transaction_id`, `classification_corrections.transaction_id / client_id`, `mapping_rules/vat_rules/review_rules.client_id`, `export_items.export_job_id`, `employees/payroll_months/filing_jobs/ai_reviews/system_metrics/notifications.client_id`, `payroll_items.payroll_month_id`, `filing_results.filing_job_id`, `notifications.user_id` | 부모에 종속된 하위 데이터. 부모는 RESTRICT 경로 때문에 실제로 거의 삭제되지 않는다. 삭제되는 경우는 테스트 초기화와 거래가 없는 수임처뿐이다 |
+| **CASCADE** | `sessions.user_id`, `client_business_profiles.client_id`, `transaction_sources.import_job_id`, `classification_results.transaction_id`, `classification_corrections.transaction_id / client_id`, `mapping_rules/vat_rules/review_rules.client_id`, `export_items.export_job_id`, `employees/payroll_months/filing_jobs/ai_reviews/system_metrics/notifications.client_id`, `payroll_items.payroll_month_id`, `filing_results.filing_job_id`, `notifications.user_id` | 부모에 종속된 하위 데이터. 부모는 RESTRICT 경로 때문에 실제로 거의 삭제되지 않는다. **위험**: `clients`의 RESTRICT는 거래·가져오기·전송·대사에만 걸린다. 그래서 **거래가 없는 급여 전용 수임처**는 삭제될 수 있다. 이때 직원·월 급여·원천세 신고(`filing_jobs` → `filing_results` 접수증)·학습 기록(`classification_corrections`)까지 CASCADE로 함께 사라진다. 스키마 주석의 "학습 데이터는 절대 버리지 않는다"와도 충돌한다. `payroll_items.employee_id`의 RESTRICT가 막을 수도 있지만, CASCADE 처리 순서에 달려 있어 보장되지 않는다. → 서비스 계층은 `clients` 물리 삭제를 제공하지 않고 `active=false`만 쓴다(03 §14 G9) |
 | **SET NULL** | 사용자 참조(`sessions`·`notifications`의 `user_id` 제외, §9.1), `files.client_id`, `import_jobs.file_id`, `transactions.import_job_id`, `export_jobs.file_id`, `export_items.transaction_id`, `reconciliation_jobs.export_job_id`, `filing_results.file_id`, `audit_logs.client_id` | 이력은 남기고 참조만 끊는다. `audit_logs.actor_name`은 사용자가 삭제되어도 누가 했는지 보존한다 |
 
 ### 9.1 `users` 참조 FK 전체 (22개)
@@ -832,7 +832,9 @@ erDiagram
 1. **`system_metrics_client_period_uq`와 NULL**: `client_id`가 null인 사무소 전체 합계 행은 일반 UNIQUE에서 NULL끼리 서로 다르게 취급된다. 그래서 같은 월에 여러 행이 생길 수 있고 `ON CONFLICT` upsert가 동작하지 않는다.
    - 권장: 사무소 합계는 저장하지 않고 수임처 행을 집계해 계산한다.
    - 저장이 필요하면 `NULLS NOT DISTINCT`로 바꿔야 한다(계약 변경).
-2. **중복 판정 경쟁 조건**: `tx_fingerprint_idx`가 유일하지 않다. 그래서 같은 수임처에 두 가져오기가 동시에 돌면 둘 다 "신규"로 판정할 수 있다. 가져오기 작업은 수임처 단위 advisory lock(`pg_advisory_xact_lock(hashtext(client_id))`)을 잡고 판정한다.
+2. **중복 판정 경쟁 조건**: `tx_fingerprint_idx`가 유일하지 않다. 그래서 같은 수임처에 두 가져오기가 동시에 돌면 둘 다 "신규"로 판정할 수 있다. 가져오기 작업은 수임처 단위 advisory lock을 잡고 판정한다.
+   - 잠금 키는 용도 네임스페이스를 둔 2-키 형식이다: `pg_advisory_xact_lock(<가져오기 상수>, hashtext(client_id::text))`. 전송·대사 잠금(03 §9.2)과 키 공간을 나눈다.
+   - 잠금은 판정과 삽입을 하는 **같은 DB 트랜잭션** 안에서 잡아야 효과가 있다(xact 잠금은 커밋 때 풀린다).
 3. **`status` 계열 컬럼은 `text`**이고 CHECK 제약이 없다. 값 검증은 TypeScript `$type<>`과 서비스 계층이 맡는다. 운영이 안정되면 CHECK 제약 추가를 검토한다.
 4. **`jsonb` 스냅샷**: `transactions.risk_flags`, `classification_results.account/vat`, `reconciliation_jobs.report`는 당시 판단을 **그대로** 보존하는 스냅샷이다. 규칙이 바뀌어도 과거 판단 근거는 바뀌지 않는다.
 

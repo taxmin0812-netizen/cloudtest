@@ -119,3 +119,14 @@ describe('decide', () => {
     expect(decide(null, acc({ confidence: 75 }), vat(), [], policy).reviewLevel).toBe('quick_review');
   });
 });
+
+describe('decide — 신규 거래처 추정 보강', () => {
+  it('업종 패턴 분류의 historyCount 는 다른 수임처 이력이라 신규 거래처로 본다', () => {
+    const d = decide(null, acc({ source: 'industry_pattern', evidence: { historyCount: 40, peerClientCount: 6 } }), vat(), []);
+    expect(d.buckets).toContain('new_merchant');
+  });
+  it('사용자 규칙 + 이 수임처 이력 있음 → 신규 아님, 이력 없음 → 신규', () => {
+    expect(decide(null, acc({ source: 'user_rule', evidence: { historyCount: 3 } }), vat(), []).buckets).not.toContain('new_merchant');
+    expect(decide(null, acc({ source: 'user_rule', evidence: { historyCount: 0 } }), vat(), []).buckets).toContain('new_merchant');
+  });
+});

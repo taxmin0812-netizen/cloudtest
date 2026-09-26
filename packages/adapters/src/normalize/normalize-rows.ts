@@ -156,7 +156,7 @@ export function normalizeRows(
 
   if (!ctx.clientId) throw new AdapterError('INVALID_CONTEXT', '거래처(수임처)가 지정되지 않았습니다.');
   const clientBizNo = normalizeBusinessNumber(ctx.businessNumber);
-  if (profile.direction === 'auto' && !clientBizNo) {
+  if (!clientBizNo) {
     throw new AdapterError('INVALID_CONTEXT', '수임처 사업자번호(10자리)가 필요합니다. 거래처 정보를 확인해 주세요.');
   }
   if (profile.purpose === 'transactions' && profile.direction === null && !ctx.direction) {
@@ -251,7 +251,7 @@ class RowNormalizer {
     private readonly headerRowIndex: number,
     private readonly map: ColumnMap,
     private readonly ctx: NormalizeContext,
-    private readonly clientBizNo: string | null,
+    private readonly clientBizNo: string,
   ) {
     const header = rows[headerRowIndex] ?? [];
     this.headerKeys = buildHeaderKeys(header, rows, headerRowIndex);
@@ -334,7 +334,7 @@ class RowNormalizer {
 
     // 세금계산서 품목 연속행: 승인번호만 있고 금액 칸이 모두 비어 있음 → 같은 승인번호 거래에 병합
     if (this.isInvoice) {
-      const apv = this.text(row, 'approvalNumber').replace(/\s+/g, '');
+      const apv = this.approvalOf(row, sourceRowNumber, false);
       const amountsBlank = (['supplyAmount', 'vatAmount', 'totalAmount'] as const).every((f) => this.text(row, f) === '');
       if (apv && amountsBlank) return { kind: 'continuation', sourceRowNumber, approvalKey: apv, row, raw };
     }
@@ -414,6 +414,15 @@ class RowNormalizer {
     const foreignAmt = this.text(row, 'foreignAmount');
     const isForeign =
       currency !== 'KRW' || /해외|국외|foreign|overseas|^y$/i.test(overseas) || (foreignAmt !== '' && foreignAmt !== '0' && parseWon(foreignAmt) !== 0);
+    // 통화가 원화가 아닌데 외화금액 열이 따로 없으면, 금액 열이 원화 환산액인지 알 수 없다 → 원화로 가정하지 않는다
+    if (currency !== 'KRW' && this.map.foreignAmount === undefined) {
+      throw new RowFailureSignal(
+        'foreign_amount_not_won',
+        `통화가 ${currency}인데 외화금액 열이 따로 없어 금액이 원화 환산액인지 확인할 수 없습니다 — 원화 환산 금액이 있는 파일로 받아 주세요.`,
+        'currency',
+        null,
+      );
+    }
 
     // 4) 금액
     const amounts = this.resolveAmounts(row, { direction, evidenceType, isForeign, derived });
@@ -452,7 +461,7 @@ class RowNormalizer {
     const category = this.text(row, 'merchantCategory');
     const merchantCategory = [bizType, category].filter(Boolean).join(' / ') || null;
     const cardNumberMasked = maskCard(this.get(row, 'cardNumber'));
-    const approvalNumber: string | null = this.text(row, 'approvalNumber').replace(/\s+/g, '') || null;
+    const approvalNumber = this.approvalOf(row, sourceRowNumber, true);
     let originalSourceId: string | null = null;
     if (ledger && !approvalNumber) {
       const mgmt = this.text(row, 'managementNumber');
@@ -467,7 +476,7 @@ class RowNormalizer {
 
     const tx: NormalizedTransaction = {
       clientId: this.ctx.clientId,
-      businessNumber: this.clientBizNo ?? normalizeBusinessNumber(this.ctx.businessNumber) ?? this.ctx.businessNumber,
+      businessNumber: this.clientBizNo,
       source: this.ctx.source ?? profile.source,
       channel: this.ctx.channel,
       direction,
@@ -505,6 +514,21 @@ class RowNormalizer {
     return { kind: 'tx', tx, row };
   }
 
+  /**
+   * 승인번호. 엑셀이 숫자로 저장한 15자리 이상 값은 유효숫자 15자리 이후가 이미 손실되었을 수 있어
+   * 식별자로 쓰지 않는다 (다른 계산서끼리 병합·중복 판정되는 사고 방지).
+   */
+  private approvalOf(row: readonly unknown[], sourceRowNumber: number, warn: boolean): string | null {
+    const v = this.get(row, 'approvalNumber');
+    if (typeof v === 'number' && Number.isFinite(v) && Math.abs(v) >= 1e15) {
+      if (warn) {
+        this.warn(sourceRowNumber, 'approval_number_precision', `승인번호가 숫자 셀(${cellText(v)})로 저장되어 뒷자리가 손실되었을 수 있습니다 — 승인번호 없이 처리했습니다. 원본을 텍스트 형식으로 내려받아 주세요.`);
+      }
+      return null;
+    }
+    return cellText(v).replace(/\s+/g, '') || null;
+  }
+
   /** 금액 확정 (검산·역산). 실패 시 RowFailureSignal */
   private resolveAmounts(
     row: readonly unknown[],
@@ -527,7 +551,9 @@ class RowNormalizer {
     };
 
     let supply = parse('supplyAmount');
-    let vat = rule.vatAlwaysZero ? 0 : parse('vatAmount');
+    // 면세 형식: 세액 열이 없거나 비어 있으면 0, 있으면 읽어서 0 인지 검사한다 (세금계산서 오판정 방지)
+    let vat = parse('vatAmount');
+    if (vat === undefined && rule.vatAlwaysZero) vat = 0;
     const svc = rule.components.includes('serviceCharge') ? (parse('serviceCharge') ?? 0) : 0;
     const taxFree = rule.components.includes('taxFreeAmount') ? (parse('taxFreeAmount') ?? 0) : 0;
     const service = svc + taxFree;
@@ -827,20 +853,38 @@ class RowNormalizer {
     return raw;
   }
 
-  private scrubCell(col: number, header: string, v: unknown): unknown {
-    const field = this.fieldAt.get(col);
-    const value: unknown = v instanceof Date ? (Number.isNaN(v.getTime()) ? null : v.toISOString()) : v;
-    if (field === 'cardNumber' || /카드번호/.test(header)) return maskCard(value);
-    const s = typeof value === 'string' ? value.trim() : typeof value === 'number' && Number.isSafeInteger(value) ? String(value) : null;
-    if (s === null) return value;
-    if (/주민|외국인등록|생년월일/.test(header)) {
-      if (looksLikeResidentNumber(s)) return maskResidentLike(s);
-      return s.replace(/\d/g, '*');
+  /** 열별 마스킹 방식 (행마다 헤더 정규식을 돌리지 않도록 캐시) */
+  private readonly colKind = new Map<number, 'card' | 'rrn' | 'identifier' | 'free'>();
+
+  private kindOf(col: number, header: string): 'card' | 'rrn' | 'identifier' | 'free' {
+    let k = this.colKind.get(col);
+    if (!k) {
+      const field = this.fieldAt.get(col);
+      if (field === 'cardNumber' || /카드번호/.test(header)) k = 'card';
+      else if (/주민|외국인등록|생년월일/.test(header)) k = 'rrn';
+      else if (field && (IDENTIFIER_FIELDS.has(field) || AMOUNT_FIELDS.has(field) || field === 'transactionDate')) k = 'identifier';
+      else k = 'free';
+      this.colKind.set(col, k);
     }
-    if (looksLikeResidentNumber(s)) return maskResidentLike(s);
-    if (field && (IDENTIFIER_FIELDS.has(field) || AMOUNT_FIELDS.has(field) || field === 'transactionDate')) return value;
-    if (!isMasked(s) && looksLikeFullCardNumber(s)) return maskCard(s);
-    return typeof value === 'string' ? scrubFreeText(value) : value;
+    return k;
+  }
+
+  private scrubCell(col: number, header: string, v: unknown): unknown {
+    const kind = this.kindOf(col, header);
+    const value: unknown = v instanceof Date ? (Number.isNaN(v.getTime()) ? null : v.toISOString()) : v;
+    if (kind === 'card') return maskCard(value);
+    // 정수 셀은 2^53 을 넘어도 자릿수 그대로 문자열화한다 (cellText 는 BigInt 경로)
+    const s = typeof value === 'string' ? value.trim() : typeof value === 'number' && Number.isInteger(value) ? cellText(value) : null;
+    if (s === null) return value;
+    if (kind === 'rrn') return looksLikeResidentNumber(s) ? maskResidentLike(s) : s.replace(/\d/g, '*');
+    // 공급받는자 등록번호 자리에 주민번호가 오는 경우(개인 발급분)까지 마스킹
+    if (s.length >= 13 && looksLikeResidentNumber(s)) return maskResidentLike(s);
+    if (kind === 'identifier') return value;
+    // 2^53 을 넘는 숫자 셀은 이미 정밀도가 깨져 Luhn 확인이 무의미하다 → 13~19자리면 카드번호로 보고 마스킹
+    if (typeof value === 'number' && !Number.isSafeInteger(value) && s.length >= 13 && s.length <= 19) return maskCard(s);
+    if (s.length >= 13 && !isMasked(s) && looksLikeFullCardNumber(s)) return maskCard(s);
+    // 숫자가 13개 미만이면 카드번호·주민번호가 들어 있을 수 없다
+    return typeof value === 'string' && digitCount(value) >= 13 ? scrubFreeText(value) : value;
   }
 
   private warn(sourceRowNumber: number | null, code: string, message: string): void {
@@ -849,6 +893,15 @@ class RowNormalizer {
 }
 
 // ────────────────────────────── 헬퍼 ──────────────────────────────
+
+function digitCount(s: string): number {
+  let n = 0;
+  for (let i = 0; i < s.length; i++) {
+    const c = s.charCodeAt(i);
+    if (c >= 48 && c <= 57) n++;
+  }
+  return n;
+}
 
 function headerKeyOf(row: readonly unknown[]): string {
   const cells = row.map(normalizeHeader);

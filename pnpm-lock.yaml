@@ -29,6 +29,9 @@ importers:
 
   apps/bridge:
     dependencies:
+      '@mintax/adapters':
+        specifier: workspace:*
+        version: link:../../packages/adapters
       '@mintax/core':
         specifier: workspace:*
         version: link:../../packages/core

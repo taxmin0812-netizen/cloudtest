@@ -49,7 +49,7 @@
 | `border` | 228 230 235 | `#E4E6EB` | 구분선, 셀 경계 |
 | `fg` | 17 24 39 | `#111827` | 본문 |
 | `muted` | 107 114 128 | `#6B7280` | 보조 문구, 비활성, 제외된 행 |
-| `navy` | 16 30 64 | `#101E40` | 좌측 내비게이션 배경, 제품명 |
+| `navy` | 16 30 64 | `#101E40` | 제품 로고 배지·강조 제목 (현재 셸의 좌측 내비 바탕은 `surface`) |
 | `primary` | 37 84 214 | `#2554D6` | 주 행동 버튼, 포커스, 링크, 선택 행 테두리 |
 | `primary-soft` | 235 241 253 | `#EBF1FD` | 선택 행 배경, `FILE_BASED` 배지 |
 | `success` / `-soft` | 22 142 84 / 231 246 238 | `#168E54` / `#E7F6EE` | 자동확정, 승인, 대사 균형, `LIVE` |
@@ -121,7 +121,7 @@
   - 작업 트레이: 실행 중·방금 끝난 백그라운드 작업. 끝나면 사라진다
   - 알림: 해결되지 않은 **문제**의 수
   - 사용자 메뉴
-- **좌측 내비 216px** (`navy` 바탕, 접으면 56px 아이콘만)
+- **좌측 내비 216px** (`surface` 바탕 + 오른쪽 `border` — 현재 셸 `app-shell.tsx`. 접으면 56px 아이콘만)
   - 메뉴 옆 숫자는 **처리할 일**만 보여 준다(예외 12, 빠른 검토 40). 0이면 숨긴다.
   - 예외 검토 화면에 들어가면 자동으로 접혀 그리드 폭을 확보한다.
 - **우측 패널 360px**: 설명 패널·상세 드로어. 본문을 덮지 않고 폭을 나눈다.
@@ -136,8 +136,8 @@ flowchart LR
   ROOT["MIN TAX OPS"] --> DASH["대시보드 /"]
   ROOT --> INBOX["예외 검토 /inbox"]
   INBOX --> QUICK["빠른 검토 /inbox/quick"]
-  ROOT --> EXP["WEHAGO 전송센터 /export"]
-  EXP --> EXPD["전송 상세 /export/:jobId"]
+  ROOT --> EXP["WEHAGO 전송센터 /transfer"]
+  EXP --> EXPD["전송 상세 /transfer/:jobId"]
   EXP --> RECON["대사 상세 /reconciliation/:id"]
   ROOT --> IMP["자료 수집 /imports"]
   IMP --> IMPD["가져오기 결과 /imports/:id"]
@@ -146,7 +146,8 @@ flowchart LR
   ROOT --> PAY["인건비 /payroll"]
   PAY --> STUDIO["Automation Studio /payroll/:clientId/setup"]
   PAY --> WIZ["월 급여 마법사 /payroll/:clientId/:period"]
-  ROOT --> WHT["원천세 Control Tower /withholding"]
+  ROOT --> WHT["원천세 Control Tower /filing"]
+  ROOT --> REV["AI 장부검토 /review"]
   ROOT --> RULES["Rule Studio /rules"]
   ROOT --> KPI["KPI /kpi"]
   ROOT --> AUD["감사로그 /audit"]
@@ -165,20 +166,24 @@ flowchart LR
 | `/` | 대시보드 | `transactions.read` | `transactions`(버킷 집계), `system_metrics`, `export_jobs`, `reconciliation_jobs`, `payroll_months`, `filing_jobs`, `ai_reviews` |
 | `/inbox` | 예외 검토 (Grid) | `transactions.read` (처리는 `transactions.review`) | `transactions`, `classification_results`, `transaction_sources` |
 | `/inbox/quick` | 빠른 검토 | 위와 같음 | `transactions(review_level='quick_review')` |
-| `/export` | WEHAGO 전송센터 | `export.create` | `transactions` 집계, `export_jobs`, `reconciliation_jobs` |
-| `/export/:jobId` | 전송 상세 | `export.create` | `export_jobs`, `export_items`, `files` |
+| `/transfer` | WEHAGO 전송센터 | `export.create` | `transactions` 집계, `export_jobs`, `reconciliation_jobs` |
+| `/transfer/:jobId` | 전송 상세 | `export.create` | `export_jobs`, `export_items`, `files` |
 | `/reconciliation/:id` | 대사 상세 | `transactions.read` | `reconciliation_jobs.report` |
 | `/imports` | 자료 수집 | `imports.create` | `import_jobs`, `files`, `transaction_sources` |
 | `/clients`, `/clients/:id` | 수임처 목록 · 수임처 360 | `clients.read` | `clients`, `client_business_profiles` 외 전 영역 |
 | `/payroll/:clientId/setup` | Payroll Automation Studio | `payroll.read` | `employees` |
 | `/payroll/:clientId/:period` | 월 급여 마법사 | `payroll.write` | `payroll_months`, `payroll_items` |
-| `/withholding` | 원천세 Control Tower | `filing.write` | `filing_jobs`, `filing_results` |
+| `/filing` | 원천세 Control Tower | `filing.write` | `filing_jobs`, `filing_results` |
+| `/review` | AI 장부검토 (선택 기능) | `transactions.read` | `ai_reviews` (`LedgerAnomaly`) |
 | `/rules` | Rule Studio | `rules.read` | `mapping_rules`, `vat_rules`, `review_rules`, `classification_corrections` |
 | `/kpi` | KPI | `transactions.read` | `system_metrics` |
 | `/audit` | 감사로그 | `audit.read` | `audit_logs` |
 | `/settings/*` | 설정 | `settings.write` (연동 개발자 모드는 `integrations.developer`) | `settings`, `users`, `integration_connections`, `account_codes` |
 
 권한이 없는 메뉴는 **숨긴다**. URL로 직접 들어오면 "이 화면을 볼 권한이 없습니다. 관리자에게 [필요 권한] 권한을 요청하세요."를 보여 준다.
+
+- 경로는 이미 구현된 웹 셸 `apps/web/src/components/shell/nav.ts`의 `href`와 맞췄다(`/transfer`, `/filing`, `/review`). 둘이 다르면 셸 코드가 기준이고 이 표를 고친다.
+- 셸의 메뉴 이름은 이 문서 용어와 일부 다르다. 셸은 "예외함", "원천세 신고", "거래처"(수임처 목록), "자동화 KPI", "감사 로그"를 쓴다. 화면 문구 결정은 웹 담당이 한다. 권장은 §0.1이다. 특히 고객사를 "거래처"라고 부르면 거래 상대방과 헷갈리므로 "수임처"를 권장한다.
 
 ---
 
@@ -227,7 +232,7 @@ flowchart LR
 │ (건수 0인 버킷은 표시하지 않음)                                                               │
 ├──────────────────────────────────────┬───────────────────────────────────────────────────────┤
 │ 마감·신고                             │ 전송·대사 문제                                         │
-│ 원천세 D-3 미신고 4곳 →               │ 상록건설 · 계정코드 없음 3건 [3건 검토하기]              │
+│ 지급명세서 D-4 미제출 4곳 →           │ 상록건설 · 계정코드 없음 3건 [3건 검토하기]              │
 │ 인건비 미검토 2곳 (변경 3명) →         │ 미소카페 · 부가세 합계 1원 차이 [차이 보기]              │
 │ 접수증 미수집 7곳 →                   │ 한빛철물 · WEHAGO 역수입 누락 2건 [대사 보기]            │
 ├──────────────────────────────────────┴───────────────────────────────────────────────────────┤
@@ -240,10 +245,10 @@ flowchart LR
 | 자동처리율 | 1 − 검토 비율(02-automation-matrix §4.2 #3). 엔진이 사람 검토 없이 확정한 비율 | `/kpi` |
 | No-Touch율 | `no_touch / total_transactions` (02 §4.2 #1). 자동확정 사후 수정률을 작은 글씨로 함께 표시 | `/kpi` |
 | 검토 필요 | `status='needs_review'` 건수 · 수임처 수 | `/inbox` |
-| 전송 차단 | 최신 `export_jobs.status='blocked'`인 수임처 수 | `/export?status=blocked` |
-| 대사 불일치 | 최신 대사 `balanced=false`인 수임처 수 | `/export?recon=mismatch` |
+| 전송 차단 | 최신 `export_jobs.status='blocked'`인 수임처 수 | `/transfer?status=blocked` |
+| 대사 불일치 | 최신 대사 보고서에 blocking 차이(`pending_review` 제외)가 1건 이상인 수임처 수. `balanced=false`만 세면 WEHAGO 누락·금액 불일치가 빠진다 | `/transfer?recon=mismatch` |
 | 버킷 행 | `ExceptionBucket`별 `needs_review` 건수·금액 (GIN 인덱스 집계) | `/inbox?bucket=…` |
-| 마감·신고 | `filing_jobs.due_date` 기준 D-7 이내 미완료, `payroll_items.needs_review` 미처리 | `/withholding?due=7`, `/payroll/…` |
+| 마감·신고 | `filing_jobs.due_date` 기준 D-7 이내 미완료, `payroll_items.needs_review` 미처리 | `/filing?due=7`, `/payroll/…` |
 | AI 검토 | `ai_reviews.status='open'`의 `LedgerAnomaly.action.href` | 해당 필터 |
 
 - 자동처리율 옆 변화량은 전월 대비 %p다. 개선·악화 모두 중립색 화살표로만 표시한다(성과를 과시하지 않는다).
@@ -257,7 +262,7 @@ flowchart LR
 #### 5.2.1 레이아웃 (내비 자동 접힘: 본문 1384px = 그리드 1024 + 설명 패널 360)
 
 ```
-┌ 예외 검토 · 2026-09 · 상록건설 ▾ ────────────────────────────────── [빠른 검토 40건 →] ┐
+┌ 예외 검토 · 2026-09 · 전체 수임처 ▾ ─────────────────────────────── [빠른 검토 40건 →] ┐
 │ [검토 필요 318] [처리함(오늘) 57] [전체]     검색 /  _______________                          │
 │ 버킷: (신규 거래처 84 ×) (저신뢰도 61) (공제/불공제 38) (고액 12) (충돌 9) …  신뢰도 [0–94] 증빙 [전체▾] │
 ├───────────────────────────────────────────────────────────────────┬──────────────────────────┤
@@ -296,7 +301,7 @@ flowchart LR
 | 근거 | 가변(최소 140) | `classification_summary`. 위험 플래그가 있으면 가장 높은 것 1개를 앞에 둔다 | — |
 | 상태 | 72 | 검토 / 승인 / 제외 / 자동확정 | — |
 
-- "전체 수임처"로 보면 **수임처** 열(120)이 거래처 앞에 추가되고, 적요 최소폭이 80으로 줄어든다.
+- "전체 수임처"로 보면 **수임처** 열(120)이 거래처 앞에 추가되고, 적요 최소폭이 80으로 줄어든다. 위 스케치는 전체 수임처 보기(대시보드와 같은 318건)이지만 폭 때문에 수임처 열을 생략했다.
 - 기본 정렬: 위험 심각도 → 신뢰도 오름차순 → 금액 내림차순. 가장 위험한 것을 먼저 본다.
 - MOCK 연동에서 들어온 거래는 날짜 앞에 `MOCK` 배지를 붙인다.
 
@@ -316,7 +321,7 @@ flowchart LR
 | `Enter` | 설명 패널 열기/닫기 | |
 | `/` | 검색 입력으로 이동 | |
 | `Esc` | 팝오버 닫기 → 선택 해제 순 | |
-| `Ctrl+Z` | 방금 한 처리 되돌리기 | 감사로그 되돌리기와 같은 경로(`revert_of_id`). 전송파일에 이미 포함된 거래는 되돌리기 전에 경고한다 |
+| `Ctrl+Z` | 방금 한 처리 되돌리기 | 감사로그 되돌리기와 같은 경로(`revert_of_id`). 전송파일에 이미 포함된 거래는 [03 §4.2](./03-architecture.md#42-거래-상태-기계) 전송 후 변경 규칙을 따른다. 파일이 `ready`이면 되돌리고 파일을 차단한다. `downloaded`·`uploaded_confirmed`이면 되돌리지 않고 "이미 WEHAGO용 파일로 받은 거래입니다. [정정 전송]"을 보여 준다 |
 | `?` | 단축키 도움말 | |
 
 - 입력창에 포커스가 있으면 단일 문자 단축키를 끈다.
@@ -356,10 +361,12 @@ flowchart LR
 
 - 묶음 기준: `수임처 + merchant_key + 추천 계정 + 부가세 판단`
 - **이상치**: 묶음 안에서 금액이 평균의 3배 이상이거나 다른 위험 플래그가 붙은 거래(설정값). 이상치는 묶음 승인에서 빠지고 예외 검토로 넘어간다.
-- 묶음 계정 변경(M)은 거래마다 수정을 기록한다. 다만 규칙 제안 임계치에는 **1회**로 센다. 한 번의 판단이 여러 번으로 계산되어 규칙이 성급하게 제안되는 것을 막기 위해서다.
+- 묶음 계정 변경(M)은 거래마다 수정을 기록한다. 다만 규칙 제안 임계치와 `correction_memory` 횟수에는 **1회**로 센다. 한 번의 판단이 여러 번으로 계산되어 규칙이 성급하게 제안되는 것을 막기 위해서다.
+  - **구현 주의**: core `analyzeCorrections`와 `correction_memory` 사다리는 수정 **행 수**를 그대로 센다. 그래서 서버가 같은 묶음의 수정을 1건으로 접어서 넘겨야 한다.
+  - 묶음 식별자는 `classification_corrections.reason`에 `bulk:{감사로그 ID}` 형식으로 남기는 것을 제안한다. 이 처리가 없으면 18건 묶음 수정 한 번으로 곧바로 규칙이 제안되고, 수정 기억 신뢰도가 94가 된다.
 - 키보드: `J/K` 묶음 이동, `A` 묶음 승인, `→`/`←` 펼치기·접기, `M` 묶음 수정
 
-### 5.4 WEHAGO 전송센터 `/export`
+### 5.4 WEHAGO 전송센터 `/transfer`
 
 **목적**: 수임처별로 파이프라인 어디에 멈춰 있는지 보고, 다음 행동 한 가지를 실행한다.
 
@@ -397,12 +404,21 @@ flowchart LR
 | `uploaded_confirmed` | WEHAGO 결과 대사 | WEHAGO 매입매출장 엑셀 업로드 → `reconcile(post_export)` |
 | 대사완료 | — | |
 
-- **전송 상세 드로어**(`/export/:jobId`, 우측 360px)
+- **전송 상세 드로어**(`/transfer/:jobId`, 우측 360px)
   - 서식: `template_key` · `template_version`. 서식이 MOCK이면 경고를 붙인다.
   - 행 수·공급가액·부가세·합계, 사전검증 결과(`validation`), 버전 이력(v1, v2 …), 관련 감사로그
-- **MOCK 서식 안전장치**
-  - 파일명 앞에 `MOCK_`을 붙이고, 첫 행에 "개발용 서식 — WEHAGO에 올리지 마세요"를 넣는다.
-  - "업로드 완료 확인" 버튼을 끈다.
+- **서식 상태별 안전장치** (`packages/adapters` 템플릿의 `status`·`verified`)
+
+| 서식 상태 | 뜻 | 화면 |
+|---|---|---|
+| `mock` | 열 구성을 모르는 개발용 서식 (현재 급여·사업소득·일용직) | 파일명 앞에 `MOCK_`을 붙이고, 첫 행에 "개발용 서식 — WEHAGO에 올리지 마세요"를 넣는다. "업로드 완료 확인" 버튼을 끈다 |
+| `standard` + `verified=false` | MIN TAX OPS 표준 레이아웃. WEHAGO 실서식과 같은지 확인되지 않음 (현재 매입매출·일반전표) | 배지 "검증필요 서식". 받기 전에 확인 다이얼로그: "WEHAGO 실서식으로 확인되지 않은 파일입니다. 열 매칭 화면에서 공급가액·부가세 열을 확인하고 올리세요." 이 서식으로 올린 기간은 **역수입 대사(`post_export`)가 필수**다. 대사 전까지 전송센터 행에 "WEHAGO 반영 미확인" 경고를 남기고, 마감 체크리스트에서 완료 처리를 막는다 |
+| `office_sample` + `verified=true` | 사무소가 WEHAGO에서 내려받은 실서식으로 등록하고 첫 업로드에 성공함 | 경고 없음 |
+
+- **다시 만들기(v2 이상)** — [03 §8.3](./03-architecture.md#83-전송-버전과-정정-전송-이중-기장-방지)
+  - 이전 버전이 `downloaded`·`uploaded_confirmed`이면 생성 버튼 옆에 경고를 띄운다: "v1을 이미 받았습니다. WEHAGO에 올렸다면 v2를 올리기 전에 v1 전표(행 488 · 합계 36,210,000원)를 지워야 합니다."
+  - v2의 "업로드 완료 확인"에는 "WEHAGO에서 v1 전표를 삭제했습니다" 체크가 필수다.
+  - 이전 `ready` 버전은 "무효(v2로 대체)"로 표시하고 받을 수 없게 한다.
 - 차단 사유 예시
   - "WEHAGO 파일 생성 중 3건의 계정코드를 찾지 못했습니다. [3건 검토하기]"
   - "매입매출 전표에 필요한 거래처코드가 12건 없습니다. [거래처코드 등록]"
@@ -411,7 +427,7 @@ flowchart LR
 ### 5.5 대사 상세 `/reconciliation/:id`
 
 ```
-┌ 대사 · 미소카페 · 2026-09 · 전송 전(pre_export) · 불일치 · 전송 차단 ─────────── [다시 대사] ┐
+┌ 대사 · 미소카페 · 2026-09 · 전송 전 파일검증(pre_export, v2) · 불일치 · 전송 차단 ── [다시 대사] ┐
 │ 원본 230건 12,480,300 = 전송 226건 12,302,210 + 중복 2건 98,000 + 제외 1건 40,000               │
 │                         + 실패 0 + 대기 1건 40,089  → 차이: 부가세 −1원                            │
 ├──────────────────────────────────────────────────────────────────────────────────────────────┤
@@ -420,11 +436,11 @@ flowchart LR
 │ 처리         228   11,256,640    1,125,660   12,382,300                                          │
 │ 전송         226   11,183,828    1,118,382   12,302,210                                          │
 │ WEHAGO        —            —            —            —                                           │
-├ [차이 목록 2] [증빙별] [계정별] [원본 행 추적] ───────────────────────────────────────────────┤
+├ [차이 목록 3] [증빙별] [계정별] [원본 행 추적] ───────────────────────────────────────────────┤
 │ 차단 · 미검토        09-28 스타벅스 40,089   검토하지 않은 거래가 1건 있습니다. [검토하기]         │
-│ 차단 · 설명 불가     부가세 합계가 원본보다 1원 적습니다. 원본 행 #117 세액 3,637원 ↔ 거래 3,636원 │
-│                      (합계 역산 반올림 차이로 보입니다) [행 보기]                                  │
-│ 설명됨 · 중복        09-05 GS25 49,000 × 2   동일 승인번호. 1건을 중복으로 보관했습니다.          │
+│ 차단 · 금액 불일치   전송 행 117의 부가세가 거래보다 1원 적습니다. 거래 3,637원 ↔ 전송 3,636원       │
+│                      (서식 렌더링의 합계 역산 반올림으로 보입니다) [행 보기]                        │
+│ 설명됨 · 중복        09-05 GS25 49,000 · 2건  이미 가져온 거래와 승인번호가 같아 중복으로 보관했습니다. │
 └──────────────────────────────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -443,6 +459,8 @@ flowchart LR
 | `extra_in_wehago` | WEHAGO 추가분 |
 | `unexplained` | 차단 · 설명 불가 |
 
+- `pre_export`는 두 가지다. 파일을 만들기 전에는 "전송준비"(승인 거래 금액)로 계산한다. 파일을 만든 뒤에는 "전송"(파일 행 금액)으로 계산한다. 위 스케치는 파일을 만든 뒤다. 화면은 등식 줄에 둘 중 어느 쪽인지 표시한다.
+- `extra_in_wehago` 중 이미 매칭된 전송 행과 같은 키인 것은 "이중 기장 의심"(danger)으로 따로 보여 준다([03 §8.2](./03-architecture.md#82-단계와-시점), §14 G8).
 - 등식 줄은 네 차원(건수·공급가액·부가세·합계) 중 **어긋난 차원을 danger로 강조**한다.
 - 증빙별·계정별 탭은 같은 표를 소계 단위로 보여 준다. 각 소계에도 균형 여부를 표시한다.
 - "원본 행 추적" 탭: 원본 행 번호 → 거래 → 전송 행 번호를 한 줄로 따라간다.
@@ -457,7 +475,7 @@ flowchart LR
 │ 파이프라인  ●●●○○○○  예외검토필요 · 12건 [검토]                                              │
 │ 대사        —                                                                                 │
 │ 인건비      9월 급여 확정 대기 · 변경 2명 [마법사]                                               │
-│ 신고        원천세 D-5 · 준비 중 [Control Tower]                                                │
+│ 신고        원천세 D-16 · 준비 중 [Control Tower]                                               │
 │                                                                                               │
 │ 최근 6개월     4월   5월   6월   7월   8월   9월                                                │
 │ 자동처리율     88%   90%   92%   93%   95%   94%                                                │
@@ -525,7 +543,7 @@ flowchart LR
 | 단계 | 이름 | 하는 일 | 완료 조건 |
 |---|---|---|---|
 | 1 | 기준 확인 | 귀속월·지급월, 전월 확정 여부, 소득구분별 인원, 반기납부 여부 | 전월이 확정됨(첫 달이면 수기 시작) |
-| 2 | 자료 반영 | 전월 복사(`origin=carried_forward`) + 수임처 엑셀 가져오기(`imported`) + 수기 수정(`manual`) | 모든 재직자에 행이 있음 |
+| 2 | 자료 반영 | 전월 복사(`origin=carried_forward`) + 수임처 엑셀 가져오기(`imported`) + 수기 수정(`manual`). 엑셀이 전체 명단이면 전월과 값이 같은 사람은 `carried_forward`를 유지하고, 엑셀에 없는 전월 재직자는 행을 만들지 않고 `missing_this_month`로 넘긴다 | 모든 재직자가 행을 갖거나 `missing_this_month`로 표시됨(3단계에서 확인) |
 | 3 | **변경분 검토** | `needs_review=true`인 사람만 보여 준다. 변동 유형(`PayrollChangeKind`) 칩, 전월과 비교, 메시지 | 검토 필요 0명 |
 | 4 | 세액 계산 | 소득세·지방소득세 계산. 값은 모두 **효력일이 있는 세법 파라미터**에서 읽고, 출처는 research/03 §1.8(법령 미러 원문)이다: 사업소득 3%(+지방 0.3%), 일용근로 (일급 − 150,000) × 6% × 45%, 소액부징수 1,000원 미만(인적용역 사업소득은 2024-07-01부터 배제), 지방소득세 = 소득세의 10%. 근로소득 간이세액표와 **끝수 처리 단계는 미확인**(research/03 U12)이므로 WEHAGO 급여 결과와 교차검증하기 전까지 검증필요 배지를 붙인다. 검산: 지급총액 = 과세 + 비과세, 차인지급액 = 지급총액 − 공제 | 검산 오류 0 |
 | 5 | 확정 | 요약(인원·지급총액·세액) 확인 후 확정(`payroll.write`). 확정 후에는 행이 잠긴다 | `status=confirmed` |
@@ -536,14 +554,14 @@ flowchart LR
 - 단계 이동: 확정 전까지는 앞 단계로 자유롭게 돌아갈 수 있다. 확정 후 되돌리려면 `audit.revert` 권한이 필요하다.
 - 키보드: `J/K` 사람 이동, `A` 확인, `M` 수정, `Ctrl+Enter` 다음 단계
 
-### 5.9 원천세 Control Tower `/withholding`
+### 5.9 원천세 Control Tower `/filing`
 
 **목적**: 전 수임처의 원천세·지급명세서 진행을 한 표로 보고 마감 위험을 먼저 처리한다.
 
 ```
 ┌ 원천세 Control Tower · 지급월 2026-09 ─────────────────────────────────────────────────────┐
 │ i 전자신고 API가 없습니다. WEHAGO 또는 홈택스에서 신고한 뒤 접수증·납부서를 올려 주세요.          │
-│ 마감 D-3 미신고 4곳 [보기]   접수증 미수집 7곳 [보기]   인건비 미확정 2곳 [보기]                 │
+│ 마감 D-4 미제출 4곳 [보기]   접수증 미수집 7곳 [보기]   인건비 미확정 2곳 [보기]                 │
 ├──────────────────────────────────────────────────────────────────────────────────────────────┤
 │ 수임처     주기  기한      입력 급여 사업 일용 원천 간이 지방 신고 접수증 납부서  다음 행동        │
 │ 상록건설   매월  10-12 D-16 ●   ○   ●   —   ○   ○   ○   ○   ○     ○      [급여 확정]       │
@@ -664,7 +682,8 @@ flowchart LR
   - 메타데이터: IP, 브라우저, 세션
 - **되돌리기**
   - 조건: `revertible = true`, 아직 되돌리지 않음, `audit.revert` 권한
-  - 영향 미리보기를 먼저 보여 준다. 예: "거래 1건의 계정을 소모품비로 되돌립니다. 이 거래는 v2 전송파일에 포함되어 있어, 되돌리면 파일을 다시 만들어야 합니다."
+  - 영향 미리보기를 먼저 보여 준다. 예: "거래 1건의 계정을 소모품비로 되돌립니다. 이 거래는 아직 아무도 받지 않은(`ready`) v2 전송파일에 포함되어 있어, 되돌리면 v2가 차단되고 파일을 다시 만들어야 합니다."
+  - 포함된 전송파일이 `downloaded`·`uploaded_confirmed`이면 [되돌리기]를 끄고 [정정 전송]으로 안내한다([03 §4.2](./03-architecture.md#42-거래-상태-기계)). WEHAGO에 이미 있는 전표를 MIN TAX OPS에서만 되돌리면 두 장부가 어긋난다.
   - 되돌리면 새 로그(`revert_of_id`)가 생기고 원 로그에 `reverted_by_id`가 채워진다.
 - CSV 내보내기 자체도 감사로그(`download`)로 남는다.
 
@@ -678,7 +697,9 @@ flowchart LR
 │ 위멤버스 파일       파일 기반         통합자료 엑셀 다운로드 → 업로드/Bridge   09-26 09:10  [서식 샘플 등록] │
 │ 홈택스 원본 파일    파일 기반         세금계산서·카드·현금영수증 엑셀          09-25 17:40  [안내] │
 │ 홈택스 직접 수집    사용 불가         정책상 배제(협의 없는 스크래핑 제한)     —            —      │
-│ WEHAGO 전표        파일 기반 · MOCK   공개 전표 API 미확인. 매입매출 서식 미등록 —          [서식 등록] │
+│ WEHAGO 전표 API    사용 불가         공개 전표 API 미확인(developer 사이트 접속 불가) —      재평가 조건 │
+│ WEHAGO 매입매출 파일 파일 기반 · 검증필요 표준 서식으로 생성. 실서식 미등록            —      [서식 등록] │
+│ WEHAGO 급여 파일    MOCK(개발자 모드) 열 구성 미확인. 업로드 금지                  —      [서식 등록] │
 │ Desktop Bridge    파일 기반         PC-회계1 연결됨 · v0.3.1               3분 전       [기기 관리] │
 │ 클라우드 폴더       사용 불가         설정되지 않음                          —            [설정]  │
 │ AI (휴리스틱)      LIVE              로컬 규칙, 외부 전송 없음               —            —      │
@@ -686,6 +707,8 @@ flowchart LR
 ```
 
 - 각 행은 `integration_connections`(`status`, `status_reason`, `last_sync_at`, `last_error`)를 그대로 보여 준다. **근거 없는 상태는 표시할 수 없다**(`status_reason` 필수).
+- 스케치의 Desktop Bridge 행("PC-회계1 연결됨")은 **Bridge 구현 후 모습**이다. 2026-09-26 현재 Bridge와 `/api/bridge/*`는 구현되지 않았다. 그래서 이 행은 "사용 불가 · 미구현(설계 완료)"으로 보여야 한다([integration-architecture §7](./integration-architecture.md#7-현실적-상태표-2026-09-26)).
+- 이 화면의 상태·문구는 `packages/adapters`의 연동 레지스트리(`getIntegrationStatuses`)가 기준이다. 스케치와 다르면 레지스트리를 따른다.
 - **상태별 화면 규칙**
 
 | 상태 | 화면 규칙 |
@@ -712,7 +735,7 @@ flowchart LR
 │ ┌ 파일을 끌어 놓거나 선택하세요 (xlsx · csv · xls*) ─ 수임처·서식은 파일 내용으로 자동 판정합니다 ┐ │
 │ └──────────────────────────────────────────────────────────────────────────────────────────┘ │
 │ 시각    파일                         수임처    서식                  가져옴 중복 실패 원본 합계   상태 │
-│ 09-26  카드_상록건설_202609.xlsx     상록건설  홈택스 사업용카드 v1     500    7    2  38,452,100 부분 성공 [실패 2건] │
+│ 09-26  카드_상록건설_202609.xlsx     상록건설  홈택스 사업용카드 v1     503    7    2  38,452,100 부분 성공 [실패 2건] │
 │ 09-26  통합자료_0926.xlsx            —        알 수 없음              —      —    —  —          확인 필요 [서식 지정] │
 └──────────────────────────────────────────────────────────────────────────────────────────┘
 ```
@@ -756,7 +779,7 @@ flowchart LR
 - 알림 종류는 `notifications.kind` 6가지뿐이다: `export_error`, `recon_mismatch`, `payroll_unreviewed`, `import_failed`, `job_failed`, `rule_suggested`
 - **성공 알림은 보내지 않는다.** 작업 완료는 작업을 시작한 화면의 토스트와 상단 작업 트레이로 알린다.
 - 종 모양 옆 숫자 = `resolved_at is null`인 알림 수(읽음과 무관). 문제를 해결하면 **자동으로 해소**된다. 예: 차단되었던 전송이 `ready`가 되면 해당 `export_error`가 해소된다.
-- 중복 방지: `dedupe_key`(예: `export:{clientId}:{period}:{kind}`). 같은 문제는 한 건으로 묶고 발생 횟수만 늘린다.
+- 중복 방지: `dedupe_key`(예: `export:{clientId}:{period}:{kind}`). 같은 문제가 해결 전에 다시 생기면 새 행을 만들지 않고 기존 알림의 제목·본문만 최신 내용으로 바꾼다(부분 유일 인덱스 `notifications_dedupe_uq`). 발생 횟수 컬럼은 없다.
 - `rule_suggested`는 info로 하루 한 번 묶어서 보낸다.
 
 ```

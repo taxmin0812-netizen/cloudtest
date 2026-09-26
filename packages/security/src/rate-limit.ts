@@ -6,6 +6,7 @@
  * - 로그인: 이메일+IP 조합당 15분에 5회.
  */
 import { AccountLockedError, RateLimitError } from './errors';
+import { parseIp } from './ip';
 
 export interface RateLimitResult {
   allowed: boolean;
@@ -119,9 +120,24 @@ export function createLoginRateLimiter(opts: Partial<SlidingWindowOptions> = {})
   return new SlidingWindowRateLimiter({ ...LOGIN_RATE_LIMIT, ...opts });
 }
 
-/** 이메일(소문자·공백 제거) + IP 조합 키 */
+/**
+ * 속도 제한용 IP 키.
+ * - 같은 주소의 다른 표기('::ffff:1.2.3.4' ↔ '1.2.3.4', 대괄호·zone·0 압축)를 하나로 합친다 → 표기만 바꿔 한도를 두 배로 쓰지 못하게
+ * - IPv6 는 /64 단위로 묶는다 (가입자 1명이 /64 전체를 받으므로 주소만 바꿔 우회하는 것을 막음)
+ * - 파싱할 수 없으면 원문(없으면 'unknown')
+ */
+export function normalizeIpForRateLimit(ip: string | null | undefined): string {
+  const parsed = parseIp(ip);
+  if (!parsed) return String(ip ?? '').trim() || 'unknown';
+  if (parsed.version === 4) return parsed.bytes.join('.');
+  const groups: string[] = [];
+  for (let i = 0; i < 8; i += 2) groups.push(((parsed.bytes[i]! << 8) | parsed.bytes[i + 1]!).toString(16));
+  return `${groups.join(':')}::/64`;
+}
+
+/** 이메일(소문자·공백 제거) + IP(정규화) 조합 키 */
 export function loginRateLimitKey(email: string, ip: string | null | undefined): string {
-  return `login:${String(email ?? '').trim().toLowerCase()}|${String(ip ?? '').trim() || 'unknown'}`;
+  return `login:${String(email ?? '').trim().toLowerCase()}|${normalizeIpForRateLimit(ip)}`;
 }
 
 export const LOGIN_RATE_LIMIT_MESSAGE =
